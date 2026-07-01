@@ -25,7 +25,7 @@ app = Flask(__name__)
 #  - autocommit=True 는 필수: 안 그러면 지속 커넥션이 InnoDB REPEATABLE READ
 #    스냅샷에 고착돼 동기화가 갱신한 이름을 못 보고 옛 값을 돌려준다.
 #  - Flask 개발서버가 threaded 로 떠도 안전하도록 락으로 직렬화(로컬 PK 조회라 빠름).
-#  - 커넥션이 끊기면 ping(reconnect=True)로 되살리고, 실패하면 버리고 다음 호출에 재연결.
+#  - 커넥션이 죽으면(재시작/idle timeout) 쿼리에서 잡아 새로 열고 1회 재시도.
 _conn = None
 _conn_lock = threading.Lock()
 
@@ -43,6 +43,25 @@ def _connect():
     )
 
 
+def _reset_conn():
+    global _conn
+    try:
+        if _conn:
+            _conn.close()
+    except Exception:
+        pass
+    _conn = None
+
+
+def _query_one(d):
+    global _conn
+    if _conn is None:
+        _conn = _connect()
+    with _conn.cursor() as cur:
+        cur.execute("SELECT name, grade, company FROM cid_lookup WHERE phone=%s LIMIT 1", (d,))
+        return cur.fetchone()
+
+
 def format_cid(name, grade, company):
     """CID 표시 문자열: '이름 직급 (회사)'. 빈 값은 생략."""
     s = (name or "").strip()
@@ -57,24 +76,14 @@ def lookup(num):
     d = normalize(num, min_len=1)
     if not d:
         return ""
-    global _conn
     with _conn_lock:
         try:
-            if _conn is None:
-                _conn = _connect()
-            else:
-                _conn.ping(reconnect=True)
-            with _conn.cursor() as cur:
-                cur.execute("SELECT name, grade, company FROM cid_lookup WHERE phone=%s LIMIT 1", (d,))
-                row = cur.fetchone()
+            row = _query_one(d)
+        except (pymysql.err.OperationalError, pymysql.err.InterfaceError):
+            _reset_conn()          # 죽은 커넥션 → 새로 열고 1회 재시도
+            row = _query_one(d)
         except Exception:
-            # 커넥션이 상했으면 버리고 다음 호출에 새로 연결
-            try:
-                if _conn:
-                    _conn.close()
-            except Exception:
-                pass
-            _conn = None
+            _reset_conn()
             raise
     return format_cid(row["name"], row["grade"], row["company"]) if row else ""
 
