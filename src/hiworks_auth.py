@@ -56,6 +56,17 @@ def _save_cache(cookies):
         pass
 
 
+def _submit(page, sel):
+    """제출 버튼이 활성화되면 클릭, 안 되면 Enter. (Mantine 버튼은 입력 전 disabled)"""
+    try:
+        page.wait_for_selector(f"{sel}:not([disabled])", timeout=6000)
+        page.click(f"{sel}:not([disabled])")
+        return
+    except Exception:
+        pass
+    page.keyboard.press("Enter")
+
+
 def login_and_get_cookies():
     from playwright.sync_api import sync_playwright
 
@@ -70,42 +81,37 @@ def login_and_get_cookies():
         )
         ctx = browser.new_context()
         page = ctx.new_page()
-        page.goto(LOGIN_URL, wait_until="networkidle")
+        page.goto(LOGIN_URL, wait_until="domcontentloaded")
 
-        # 아이디/비번 필드 후보들을 순서대로 시도
-        id_selectors = [
-            "input[type=email]",
-            "input[name=id]", "input[name=userId]", "input[name=username]",
-            "input[placeholder*='아이디']", "input[placeholder*='이메일']",
-        ]
-        pw_selectors = [
-            "input[type=password]",
-            "input[name=password]", "input[name=passwd]", "input[name=pw]",
-        ]
+        # 하이웍스 로그인은 2단계(아이디 → 비밀번호) Mantine SPA.
+        # 1단계 화면엔 아이디 text 입력칸만 있고 제출 버튼은 disabled 상태.
+        ID_SEL = "input[placeholder*='onhiworks'], input[type='email'], input[type='text']"
+        PW_SEL = "input[type='password']"
+        SUBMIT = "button[type='submit']"
 
-        def fill_first(selectors, value):
-            for s in selectors:
-                el = page.query_selector(s)
-                if el:
-                    el.fill(value)
-                    return True
-            return False
-
-        if not fill_first(id_selectors, uid) or not fill_first(pw_selectors, pw):
+        # 1단계: 아이디
+        try:
+            page.wait_for_selector(ID_SEL, timeout=15000)
+        except Exception:
             _dump(page, "no-fields")
             browser.close()
-            sys.exit("로그인 폼 필드를 못 찾음. login-debug.* 를 열어 셀렉터를 확인하세요.")
+            sys.exit("로그인 폼(아이디 입력칸)을 못 찾음. login-debug-no-fields.* 확인.")
+        page.fill(ID_SEL, uid)
 
-        # 제출: Enter 또는 로그인 버튼
-        submitted = False
-        for s in ["button[type=submit]", "button:has-text('로그인')", "input[type=submit]"]:
-            el = page.query_selector(s)
-            if el:
-                el.click()
-                submitted = True
-                break
-        if not submitted:
-            page.keyboard.press("Enter")
+        # 비밀번호칸이 같은 화면에 없으면 아이디를 제출해 다음 단계로
+        if not page.query_selector(PW_SEL):
+            _submit(page, SUBMIT)
+            try:
+                page.wait_for_selector(PW_SEL, timeout=15000)
+            except Exception:
+                _dump(page, "no-password")
+                browser.close()
+                sys.exit("아이디 다음 단계에서 비밀번호칸을 못 찾음(아이디 형식/계정 확인). "
+                         "login-debug-no-password.* 확인.")
+
+        # 2단계: 비밀번호
+        page.fill(PW_SEL, pw)
+        _submit(page, SUBMIT)
 
         # 로그인 후 리다이렉트/쿠키 대기
         try:
