@@ -1,0 +1,10 @@
+[Unit]
+Description=Hiworks 주소록 동기화 30분마다 실행
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

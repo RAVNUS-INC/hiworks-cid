@@ -1,0 +1,14 @@
+[Unit]
+Description=Hiworks CID lookup HTTP endpoint (Asterisk용)
+After=network.target mariadb.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/hiworks
+EnvironmentFile=/etc/hiworks-sync.env
+ExecStart=/opt/hiworks/venv/bin/python /opt/hiworks/src/http_lookup.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

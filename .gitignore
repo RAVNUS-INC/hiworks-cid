@@ -1,0 +1,9 @@
+venv/
+cookies.json
+login-debug-*
+*.pyc
+__pycache__/
+# 로컬 비밀 파일이 실수로 리포에 들어오지 않도록
+hiworks-sync.env
+*.env
+!deploy/hiworks-sync.env.example

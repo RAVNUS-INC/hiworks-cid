@@ -1,0 +1,9 @@
+[Unit]
+Description=Hiworks 주소록 -> MySQL 동기화 (oneshot)
+After=network.target mariadb.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/hiworks
+EnvironmentFile=/etc/hiworks-sync.env
+ExecStart=/opt/hiworks/venv/bin/python /opt/hiworks/src/hiworks_sync.py
