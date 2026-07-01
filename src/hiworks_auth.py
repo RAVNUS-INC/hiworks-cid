@@ -9,7 +9,7 @@
   실패하면 스크린샷/HTML을 남겨 디버깅할 수 있게 한다.
 
 자격증명은 환경변수에서만 읽는다 (코드/파일에 저장하지 않음):
-  HIWORKS_ID   예: api@ravnus.com
+  HIWORKS_ID   예: api@yourcompany.com
   HIWORKS_PW   비밀번호
   COOKIE_FILE  선택. 기본 ./cookies.json
 
