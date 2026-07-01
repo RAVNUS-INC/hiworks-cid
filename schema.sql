@@ -7,6 +7,7 @@ CREATE TABLE IF NOT EXISTS cid_lookup (
   phone      VARCHAR(20)  NOT NULL,          -- 숫자만 저장된 정규화 번호 (예: 01012345678)
   name       VARCHAR(255) NOT NULL,
   company    VARCHAR(255) DEFAULT NULL,
+  grade      VARCHAR(100) DEFAULT NULL,       -- 직급 (예: 부장). CID 표시에 사용
   updated_at TIMESTAMP    DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (phone)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

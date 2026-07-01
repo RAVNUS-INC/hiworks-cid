@@ -70,20 +70,21 @@ def fetch_all():
 
 
 def build_entries(rows):
-    """(phone, name, company) 목록. 한 연락처에 번호가 여러 개면 분해."""
+    """(phone, name, company, grade) 목록. 한 연락처에 번호가 여러 개면 분해."""
     seen = {}
     for c in rows:
         name = (c.get("name") or "").strip()
         if not name:
             continue
         company = (c.get("company") or "").strip() or None
+        grade = (c.get("grade") or "").strip() or None
         # phone 필드는 단일 문자열이지만 여러 번호가 섞여 올 수 있어 구분자로 분해
         for part in re.split(r"[,/;\n]", c.get("phone") or ""):
             p = normalize(part)
             if p:
                 # 먼저 들어온 값 우선(중복 번호는 첫 이름 유지)
-                seen.setdefault(p, (name, company))
-    return [(p, n, co) for p, (n, co) in seen.items()]
+                seen.setdefault(p, (name, company, grade))
+    return [(p, n, co, g) for p, (n, co, g) in seen.items()]
 
 
 def sync_mysql(entries):
@@ -100,8 +101,8 @@ def sync_mysql(entries):
         with conn.cursor() as cur:
             # upsert
             cur.executemany(
-                "INSERT INTO cid_lookup (phone, name, company) VALUES (%s,%s,%s) "
-                "ON DUPLICATE KEY UPDATE name=VALUES(name), company=VALUES(company)",
+                "INSERT INTO cid_lookup (phone, name, company, grade) VALUES (%s,%s,%s,%s) "
+                "ON DUPLICATE KEY UPDATE name=VALUES(name), company=VALUES(company), grade=VALUES(grade)",
                 entries,
             )
             # 이번 스냅샷에 없는 번호 삭제

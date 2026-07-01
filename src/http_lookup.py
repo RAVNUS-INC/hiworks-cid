@@ -20,6 +20,16 @@ from phone_norm import normalize
 app = Flask(__name__)
 
 
+def format_cid(name, grade, company):
+    """CID 표시 문자열: '이름 직급 (회사)'. 빈 값은 생략."""
+    s = (name or "").strip()
+    if grade:
+        s += f" {grade.strip()}"
+    if company:
+        s += f" ({company.strip()})"
+    return s
+
+
 def lookup(num):
     d = normalize(num, min_len=1)
     if not d:
@@ -34,9 +44,9 @@ def lookup(num):
     )
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT name FROM cid_lookup WHERE phone=%s LIMIT 1", (d,))
+            cur.execute("SELECT name, grade, company FROM cid_lookup WHERE phone=%s LIMIT 1", (d,))
             row = cur.fetchone()
-            return row[0] if row else ""
+            return format_cid(row[0], row[1], row[2]) if row else ""
     finally:
         conn.close()
 
