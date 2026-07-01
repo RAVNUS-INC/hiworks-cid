@@ -1,6 +1,7 @@
 venv/
 cookies.json
 login-debug-*
+sync_state.json
 *.pyc
 __pycache__/
 # 로컬 비밀 파일이 실수로 리포에 들어오지 않도록

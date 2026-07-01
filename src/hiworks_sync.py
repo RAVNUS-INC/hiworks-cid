@@ -24,13 +24,22 @@ Hiworks 주소록 -> MySQL(asterisk.cid_lookup) 동기화
 import os
 import re
 import sys
+import socket
 import requests
 import pymysql
+from pathlib import Path
 
 from phone_norm import normalize
 
 API = "https://contact-api.office.hiworks.com/v2/contacts"
 PAGE_LIMIT = 500
+
+# 실패 알림(n8n 등 웹훅). 미설정이면 조용히 비활성.
+ALERT_WEBHOOK_URL = os.getenv("ALERT_WEBHOOK_URL")
+ALERT_AFTER_FAILURES = int(os.getenv("ALERT_AFTER_FAILURES", "3"))   # 연속 N회부터 알림
+ALERT_REPEAT_EVERY = int(os.getenv("ALERT_REPEAT_EVERY", "30"))      # 이후 N회마다 재알림(2분 주기면 ~1시간)
+# 연속 실패 카운터 저장 파일 (git 제외)
+STATE_FILE = Path(os.getenv("SYNC_STATE_FILE", "sync_state.json"))
 
 
 def _get_cookie(force=False):
@@ -121,10 +130,51 @@ def sync_mysql(entries):
         conn.close()
 
 
+def _read_fail_count():
+    try:
+        return int(STATE_FILE.read_text().strip() or "0")
+    except Exception:
+        return 0
+
+
+def _write_fail_count(n):
+    try:
+        STATE_FILE.write_text(str(n))
+    except Exception as e:
+        print(f"상태파일 기록 실패: {e}", file=sys.stderr)
+
+
+def _send_alert(payload):
+    """웹훅(n8n)으로 알림 POST. URL 미설정이면 no-op. 알림 실패가 sync를 막지 않게 예외 삼킴."""
+    if not ALERT_WEBHOOK_URL:
+        return
+    body = {"service": "hiworks-cid-sync", "host": socket.gethostname(), **payload}
+    try:
+        requests.post(ALERT_WEBHOOK_URL, json=body, timeout=10)
+    except Exception as e:
+        print(f"알림 전송 실패: {e}", file=sys.stderr)
+
+
 def main():
-    rows = fetch_all()
-    entries = build_entries(rows)
-    sync_mysql(entries)
+    try:
+        rows = fetch_all()
+        entries = build_entries(rows)
+        sync_mysql(entries)
+    except Exception as e:
+        n = _read_fail_count() + 1
+        _write_fail_count(n)
+        msg = f"{type(e).__name__}: {e}"
+        print(f"동기화 실패({n}회 연속): {msg}", file=sys.stderr)
+        # 연속 N회부터 알림, 이후 REPEAT 간격으로만 재알림(스팸 방지)
+        if n >= ALERT_AFTER_FAILURES and (n - ALERT_AFTER_FAILURES) % ALERT_REPEAT_EVERY == 0:
+            _send_alert({"status": "failed", "consecutive_failures": n, "error": msg})
+        sys.exit(1)
+
+    # 성공: 카운터 리셋, 직전에 알림 나갔었다면 복구 통지
+    prev = _read_fail_count()
+    _write_fail_count(0)
+    if prev >= ALERT_AFTER_FAILURES:
+        _send_alert({"status": "recovered", "after_failures": prev})
     print(f"동기화 완료: 연락처 {len(rows)}건 -> 번호 {len(entries)}건 적재")
 
 

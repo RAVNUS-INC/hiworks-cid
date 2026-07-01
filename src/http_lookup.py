@@ -12,12 +12,35 @@ Asterisk 예시:
   Set(CALLERID(name)=${CURL(http://127.0.0.1:8088/cid?number=${CALLERID(num)})})
 """
 import os
+import threading
 import pymysql
+
 from flask import Flask, request, Response
 
 from phone_norm import normalize
 
 app = Flask(__name__)
+
+# DB 커넥션을 요청마다 새로 열지 않고 재사용한다.
+#  - autocommit=True 는 필수: 안 그러면 지속 커넥션이 InnoDB REPEATABLE READ
+#    스냅샷에 고착돼 동기화가 갱신한 이름을 못 보고 옛 값을 돌려준다.
+#  - Flask 개발서버가 threaded 로 떠도 안전하도록 락으로 직렬화(로컬 PK 조회라 빠름).
+#  - 커넥션이 끊기면 ping(reconnect=True)로 되살리고, 실패하면 버리고 다음 호출에 재연결.
+_conn = None
+_conn_lock = threading.Lock()
+
+
+def _connect():
+    return pymysql.connect(
+        host=os.getenv("MYSQL_HOST", "127.0.0.1"),
+        port=int(os.getenv("MYSQL_PORT", "3306")),
+        user=os.environ["MYSQL_USER"],
+        password=os.environ["MYSQL_PASSWORD"],
+        database=os.getenv("MYSQL_DB", "asterisk"),
+        charset="utf8mb4",
+        autocommit=True,
+        cursorclass=pymysql.cursors.DictCursor,
+    )
 
 
 def format_cid(name, grade, company):
@@ -34,21 +57,26 @@ def lookup(num):
     d = normalize(num, min_len=1)
     if not d:
         return ""
-    conn = pymysql.connect(
-        host=os.getenv("MYSQL_HOST", "127.0.0.1"),
-        port=int(os.getenv("MYSQL_PORT", "3306")),
-        user=os.environ["MYSQL_USER"],
-        password=os.environ["MYSQL_PASSWORD"],
-        database=os.getenv("MYSQL_DB", "asterisk"),
-        charset="utf8mb4",
-    )
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT name, grade, company FROM cid_lookup WHERE phone=%s LIMIT 1", (d,))
-            row = cur.fetchone()
-            return format_cid(row[0], row[1], row[2]) if row else ""
-    finally:
-        conn.close()
+    global _conn
+    with _conn_lock:
+        try:
+            if _conn is None:
+                _conn = _connect()
+            else:
+                _conn.ping(reconnect=True)
+            with _conn.cursor() as cur:
+                cur.execute("SELECT name, grade, company FROM cid_lookup WHERE phone=%s LIMIT 1", (d,))
+                row = cur.fetchone()
+        except Exception:
+            # 커넥션이 상했으면 버리고 다음 호출에 새로 연결
+            try:
+                if _conn:
+                    _conn.close()
+            except Exception:
+                pass
+            _conn = None
+            raise
+    return format_cid(row["name"], row["grade"], row["company"]) if row else ""
 
 
 @app.route("/cid")
