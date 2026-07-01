@@ -1,9 +1,9 @@
 [Unit]
-Description=Hiworks 주소록 동기화 30분마다 실행
+Description=Hiworks 주소록 동기화 2분마다 실행
 
 [Timer]
 OnBootSec=2min
-OnUnitActiveSec=30min
+OnUnitActiveSec=2min
 Persistent=true
 
 [Install]
