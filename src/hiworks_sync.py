@@ -73,6 +73,10 @@ def build_entries(rows):
     """(phone, name, company, grade) 목록. 한 연락처에 번호가 여러 개면 분해."""
     seen = {}
     for c in rows:
+        # 공유주소록만 동기화 (개인 소유 항목은 제외).
+        # 현재 API는 type='shared'만 내려주지만, 만일을 대비해 코드로도 막는다.
+        if c.get("type") != "shared" or c.get("owner"):
+            continue
         name = (c.get("name") or "").strip()
         if not name:
             continue
