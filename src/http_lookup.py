@@ -11,22 +11,17 @@ Asterisk func_curl/CURL() 로 쓰거나, OpenCNAM 호환 응답도 지원.
 Asterisk 예시:
   Set(CALLERID(name)=${CURL(http://127.0.0.1:8088/cid?number=${CALLERID(num)})})
 """
-import os, re
+import os
 import pymysql
 from flask import Flask, request, Response
+
+from phone_norm import normalize
 
 app = Flask(__name__)
 
 
-def norm(num):
-    d = re.sub(r"\D", "", num or "")
-    if d.startswith("82"):
-        d = "0" + d[2:]
-    return d
-
-
 def lookup(num):
-    d = norm(num)
+    d = normalize(num, min_len=1)
     if not d:
         return ""
     conn = pymysql.connect(

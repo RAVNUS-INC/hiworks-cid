@@ -27,6 +27,8 @@ import sys
 import requests
 import pymysql
 
+from phone_norm import normalize
+
 API = "https://contact-api.office.hiworks.com/v2/contacts"
 PAGE_LIMIT = 500
 
@@ -38,18 +40,6 @@ def _get_cookie(force=False):
         return manual
     import hiworks_auth
     return hiworks_auth.get_cookie(force=force)
-
-
-def normalize(num: str):
-    """전화번호에서 숫자만 남기고, +82/82 국가코드를 국내 0 형태로 변환."""
-    if not num:
-        return None
-    d = re.sub(r"\D", "", num)
-    if d.startswith("82"):
-        d = "0" + d[2:]
-    if not d or len(d) < 8:
-        return None
-    return d
 
 
 def fetch_all():

@@ -30,6 +30,12 @@ COOKIE_DOMAIN_HINT = "hiworks.com"
 COOKIE_FILE = Path(os.getenv("COOKIE_FILE", "cookies.json"))
 # 쿠키 유효로 간주할 최대 나이(초). 넘으면 재로그인. 12시간 기본.
 MAX_AGE = int(os.getenv("COOKIE_MAX_AGE", str(12 * 3600)))
+# 무인 재로그인이 SPA 로딩 레이스로 간헐 실패할 수 있어 재시도 횟수를 둔다.
+LOGIN_ATTEMPTS = int(os.getenv("LOGIN_ATTEMPTS", "2"))
+
+
+class LoginError(RuntimeError):
+    """로그인 실패(폼 못 찾음/쿠키 없음 등). 재시도 대상."""
 
 
 def _cookies_to_header(cookies):
@@ -90,12 +96,17 @@ def login_and_get_cookies():
         SUBMIT = "button[type='submit']"
 
         # 1단계: 아이디
+        # SPA가 늦게 뜨면 입력칸을 놓칠 수 있어, 한 번은 reload 후 다시 기다린다.
         try:
             page.wait_for_selector(ID_SEL, timeout=15000)
         except Exception:
-            _dump(page, "no-fields")
-            browser.close()
-            sys.exit("로그인 폼(아이디 입력칸)을 못 찾음. login-debug-no-fields.* 확인.")
+            try:
+                page.reload(wait_until="domcontentloaded")
+                page.wait_for_selector(ID_SEL, timeout=15000)
+            except Exception:
+                _dump(page, "no-fields")
+                browser.close()
+                raise LoginError("로그인 폼(아이디 입력칸)을 못 찾음. login-debug-no-fields.* 확인.")
         page.fill(ID_SEL, uid)
 
         # 비밀번호칸이 같은 화면에 없으면 아이디를 제출해 다음 단계로
@@ -106,8 +117,8 @@ def login_and_get_cookies():
             except Exception:
                 _dump(page, "no-password")
                 browser.close()
-                sys.exit("아이디 다음 단계에서 비밀번호칸을 못 찾음(아이디 형식/계정 확인). "
-                         "login-debug-no-password.* 확인.")
+                raise LoginError("아이디 다음 단계에서 비밀번호칸을 못 찾음(아이디 형식/계정 확인). "
+                                 "login-debug-no-password.* 확인.")
 
         # 2단계: 비밀번호
         page.fill(PW_SEL, pw)
@@ -126,7 +137,7 @@ def login_and_get_cookies():
         if not hiworks_cookies:
             _dump(page, "login-failed")
             browser.close()
-            sys.exit("로그인 실패(쿠키 없음). 자격증명/캡차/차단 여부를 login-debug.* 로 확인하세요.")
+            raise LoginError("로그인 실패(쿠키 없음). 자격증명/캡차/차단 여부를 login-debug.* 로 확인하세요.")
 
         browser.close()
         # requests 에 쓰기 좋은 형태로 정리
@@ -141,17 +152,35 @@ def _dump(page, tag):
         pass
 
 
+def _login_with_retry(attempts=None):
+    """무인 재로그인 안정화용: LoginError 면 잠깐 쉬고 재시도, 마지막 실패는 그대로 올린다."""
+    attempts = attempts or LOGIN_ATTEMPTS
+    last = None
+    for i in range(1, attempts + 1):
+        try:
+            return login_and_get_cookies()
+        except LoginError as e:
+            last = e
+            if i < attempts:
+                print(f"로그인 시도 {i}/{attempts} 실패: {e} -> 재시도", file=sys.stderr)
+                time.sleep(3)
+    raise last
+
+
 def get_cookie(force=False):
     """동기화 스크립트가 부르는 진입점. Cookie 헤더 문자열을 반환."""
     if not force:
         cached = _load_cache()
         if cached:
             return _cookies_to_header(cached)
-    cookies = login_and_get_cookies()
+    cookies = _login_with_retry()
     _save_cache(cookies)
     return _cookies_to_header(cookies)
 
 
 if __name__ == "__main__":
     # 단독 실행: 강제 로그인 테스트
-    print(get_cookie(force="--force" in sys.argv)[:40] + "... (쿠키 발급 성공)")
+    try:
+        print(get_cookie(force="--force" in sys.argv)[:40] + "... (쿠키 발급 성공)")
+    except LoginError as e:
+        sys.exit(str(e))
