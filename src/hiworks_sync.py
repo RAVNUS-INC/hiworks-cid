@@ -39,7 +39,7 @@ PAGE_LIMIT = 500
 # 조직도(직원) 동기화 — Open API Bearer 토큰. 미설정이면 공유주소록만 동기화.
 ORG_TOKEN = os.getenv("HIWORKS_OFFICE_TOKEN")
 ORG_API_URL = os.getenv("HIWORKS_ORG_API_URL",
-                        "https://api.office.hiworks.com/hrm/v2/organizations")
+                        "https://api.hiworks.com/hrm/v2/organizations")
 
 # 실패 알림(n8n 등 웹훅). 미설정이면 조용히 비활성.
 ALERT_WEBHOOK_URL = os.getenv("ALERT_WEBHOOK_URL")
