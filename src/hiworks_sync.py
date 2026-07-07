@@ -113,11 +113,20 @@ def fetch_org():
         return None
     r = requests.get(
         ORG_API_URL,
-        headers={"Authorization": f"Bearer {ORG_TOKEN}", "Accept": "application/json"},
+        # 이 API는 GET에도 Content-Type: application/json 을 요구한다(없으면 200 + 에러 봉투)
+        headers={
+            "Authorization": f"Bearer {ORG_TOKEN}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
         timeout=20,
     )
     r.raise_for_status()
-    return r.json()
+    j = r.json()
+    # HTTP 200이어도 {code, message} 에러 봉투가 올 수 있음 → 명시적으로 실패 처리
+    if isinstance(j, dict) and "entries" not in j and "nodes" not in j:
+        raise RuntimeError(f"조직도 API 오류 응답: code={j.get('code')} message={j.get('message')}")
+    return j
 
 
 def build_org_entries(root):
