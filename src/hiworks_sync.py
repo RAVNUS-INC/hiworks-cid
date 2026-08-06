@@ -70,7 +70,9 @@ def fetch_all():
         )
         if r.status_code in (401, 403):
             if relogged:
-                sys.exit("인증 실패: 재로그인 후에도 401/403. 자격증명/계정상태를 확인하세요.")
+                # sys.exit(SystemExit)는 main의 except Exception을 우회해 실패 카운터/알림을
+                # 건너뛰므로 반드시 일반 예외로 올린다.
+                raise RuntimeError("인증 실패: 재로그인 후에도 401/403. 자격증명/계정상태를 확인하세요.")
             cookie = _get_cookie(force=True)  # 세션 만료 → 자동 재로그인
             relogged = True
             continue
