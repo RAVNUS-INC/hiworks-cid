@@ -99,5 +99,47 @@ def opencnam(number):
     return Response(lookup(number), mimetype="text/plain")
 
 
+# /health 판정 기준 (Uptime Kuma HTTP 모니터용): 초과 시 503
+HEALTH_MAX_FAILURES = int(os.getenv("HEALTH_MAX_FAILURES", "3"))
+HEALTH_MAX_AGE = int(os.getenv("HEALTH_MAX_AGE", "600"))  # 마지막 동기화 성공 후 최대 초(2분 주기의 5배)
+STATE_FILE = os.getenv("SYNC_STATE_FILE", "sync_state.json")
+
+
+@app.route("/health")
+def health():
+    """종합 상태: DB 조회 가능 + 동기화 연속실패/신선도. 비정상이면 503 (개인정보 없음)."""
+    import json, time
+    body = {"status": "ok"}
+    # DB 살아있나 + 행 수
+    try:
+        with _conn_lock:
+            global _conn
+            if _conn is None:
+                _conn = _connect()
+            with _conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) AS c FROM cid_lookup")
+                body["rows"] = cur.fetchone()["c"]
+    except Exception as e:
+        _reset_conn()
+        body.update(status="db_error", error=type(e).__name__)
+    # 동기화 상태 (sync_state.json)
+    try:
+        st = json.loads(open(STATE_FILE).read())
+        st = st if isinstance(st, dict) else {"fails": int(st)}
+    except Exception:
+        st = {}
+    fails = int(st.get("fails", 0))
+    last = st.get("last_success")
+    body["sync_consecutive_failures"] = fails
+    if last:
+        body["sync_last_success_age_sec"] = int(time.time() - last)
+    if fails >= HEALTH_MAX_FAILURES:
+        body["status"] = "sync_failing"
+    elif last and time.time() - last > HEALTH_MAX_AGE:
+        body["status"] = "sync_stale"
+    code = 200 if body["status"] == "ok" else 503
+    return Response(json.dumps(body), status=code, mimetype="application/json")
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8088")))

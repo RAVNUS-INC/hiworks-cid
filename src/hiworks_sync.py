@@ -26,6 +26,8 @@ Hiworks 주소록 -> MySQL(asterisk.cid_lookup) 동기화
 import os
 import re
 import sys
+import json
+import time
 import socket
 import requests
 import pymysql
@@ -45,8 +47,10 @@ ORG_API_URL = os.getenv("HIWORKS_ORG_API_URL",
 ALERT_WEBHOOK_URL = os.getenv("ALERT_WEBHOOK_URL")
 ALERT_AFTER_FAILURES = int(os.getenv("ALERT_AFTER_FAILURES", "3"))   # 연속 N회부터 알림
 ALERT_REPEAT_EVERY = int(os.getenv("ALERT_REPEAT_EVERY", "30"))      # 이후 N회마다 재알림(2분 주기면 ~1시간)
-# 연속 실패 카운터 저장 파일 (git 제외)
+# 연속 실패 카운터/마지막 성공시각 저장 파일 (git 제외). /health 가 읽음.
 STATE_FILE = Path(os.getenv("SYNC_STATE_FILE", "sync_state.json"))
+# 동기화 성공 시마다 호출할 Uptime Kuma push URL. 끊기면 Kuma 가 알림.
+HEARTBEAT_URL = os.getenv("HEARTBEAT_URL")
 
 
 def _get_cookie(force=False):
@@ -187,18 +191,33 @@ def sync_mysql(entries):
         conn.close()
 
 
-def _read_fail_count():
+def _load_state():
+    """상태파일 -> {"fails": n, "last_success": ts|None}. 구버전(정수만) 형식도 호환."""
     try:
-        return int(STATE_FILE.read_text().strip() or "0")
+        raw = STATE_FILE.read_text().strip()
+        d = json.loads(raw)
+        if isinstance(d, dict):
+            return {"fails": int(d.get("fails", 0)), "last_success": d.get("last_success")}
+        return {"fails": int(d), "last_success": None}
     except Exception:
-        return 0
+        return {"fails": 0, "last_success": None}
 
 
-def _write_fail_count(n):
+def _save_state(state):
     try:
-        STATE_FILE.write_text(str(n))
+        STATE_FILE.write_text(json.dumps(state))
     except Exception as e:
         print(f"상태파일 기록 실패: {e}", file=sys.stderr)
+
+
+def _heartbeat():
+    """성공 시 Uptime Kuma push URL 호출. 미설정이면 no-op. 실패해도 sync 를 막지 않음."""
+    if not HEARTBEAT_URL:
+        return
+    try:
+        requests.get(HEARTBEAT_URL, timeout=10)
+    except Exception as e:
+        print(f"하트비트 전송 실패: {e}", file=sys.stderr)
 
 
 def _send_alert(payload):
@@ -225,8 +244,9 @@ def main():
         entries = [(p, n, co, g) for p, (n, co, g) in merged.items()]
         sync_mysql(entries)
     except Exception as e:
-        n = _read_fail_count() + 1
-        _write_fail_count(n)
+        state = _load_state()
+        n = state["fails"] + 1
+        _save_state({**state, "fails": n})
         msg = f"{type(e).__name__}: {e}"
         print(f"동기화 실패({n}회 연속): {msg}", file=sys.stderr)
         # 연속 N회부터 알림, 이후 REPEAT 간격으로만 재알림(스팸 방지)
@@ -234,9 +254,10 @@ def main():
             _send_alert({"status": "failed", "consecutive_failures": n, "error": msg})
         sys.exit(1)
 
-    # 성공: 카운터 리셋, 직전에 알림 나갔었다면 복구 통지
-    prev = _read_fail_count()
-    _write_fail_count(0)
+    # 성공: 카운터 리셋 + 성공시각 기록 + 하트비트, 직전에 알림 나갔었다면 복구 통지
+    prev = _load_state()["fails"]
+    _save_state({"fails": 0, "last_success": time.time()})
+    _heartbeat()
     if prev >= ALERT_AFTER_FAILURES:
         _send_alert({"status": "recovered", "after_failures": prev})
     emp_note = f" (직원 {len(employees)}번호 포함)" if employees else ""
