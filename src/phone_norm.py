@@ -20,9 +20,11 @@ def normalize(num, min_len=8):
     # 국제표기 → 국내 0
     #   00 82 xxxx (00 = 국제전화 접속번호) 를 +82 보다 먼저 처리
     if d.startswith("0082"):
-        d = "0" + d[4:]
+        local = d[4:]
+        d = local if local.startswith("0") else "0" + local
     elif d.startswith("82"):
-        d = "0" + d[2:]
+        local = d[2:]
+        d = local if local.startswith("0") else "0" + local
     if not d or len(d) < min_len:
         return None
     return d

@@ -2,6 +2,7 @@
 """phone_norm.normalize 단위 테스트. 의존성 없이 실행: python tests/test_normalize.py"""
 import os
 import sys
+import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from phone_norm import normalize  # noqa: E402
@@ -32,30 +33,34 @@ LOOKUP_CASES = [
 ]
 
 
-def run():
-    fails = 0
-    for inp, exp in CASES:
-        got = normalize(inp)
-        ok = got == exp
-        fails += not ok
-        print(f"{'ok ' if ok else 'FAIL'} normalize({inp!r}) = {got!r} (기대 {exp!r})")
-    for inp, exp in LOOKUP_CASES:
-        got = normalize(inp, min_len=1)
-        ok = got == exp
-        fails += not ok
-        print(f"{'ok ' if ok else 'FAIL'} normalize({inp!r}, min_len=1) = {got!r} (기대 {exp!r})")
+class NormalizeTests(unittest.TestCase):
+    def test_saved_numbers(self):
+        for inp, exp in CASES:
+            with self.subTest(number=inp):
+                self.assertEqual(normalize(inp), exp)
 
-    # 일관성 계약: 저장/조회가 같은 입력에 대해 (둘 다 값이 나올 때) 동일해야 함
-    for inp in ["+821012345678", "010-1234-5678", "0082-2-123-4567"]:
-        a = normalize(inp)                 # 저장
-        b = normalize(inp, min_len=1)      # 조회
-        ok = a == b
-        fails += not ok
-        print(f"{'ok ' if ok else 'FAIL'} 일관성 {inp!r}: 저장={a!r} 조회={b!r}")
+    def test_lookup_numbers(self):
+        for inp, exp in LOOKUP_CASES:
+            with self.subTest(number=inp):
+                self.assertEqual(normalize(inp, min_len=1), exp)
 
-    print(f"\n{'PASSED' if fails == 0 else f'{fails} FAILED'}")
-    return fails
+    def test_storage_and_lookup_share_rules(self):
+        for inp in ["+821012345678", "010-1234-5678", "0082-2-123-4567"]:
+            with self.subTest(number=inp):
+                self.assertEqual(normalize(inp), normalize(inp, min_len=1))
+
+    def test_equivalent_international_and_domestic_numbers_match(self):
+        forms = {
+            "01012345678": ["+82 (0)10-1234-5678", "0082 010-1234-5678",
+                            "82 010-1234-5678", "+82 10-1234-5678", "010-1234-5678"],
+            "0212345678": ["+82 (0)2-1234-5678", "0082 02-1234-5678", "+82 2-1234-5678"],
+        }
+        for domestic, variants in forms.items():
+            for variant in variants:
+                with self.subTest(number=variant):
+                    self.assertEqual(normalize(variant), domestic)
+                    self.assertEqual(normalize(variant, min_len=1), normalize(domestic, min_len=1))
 
 
 if __name__ == "__main__":
-    sys.exit(1 if run() else 0)
+    unittest.main()

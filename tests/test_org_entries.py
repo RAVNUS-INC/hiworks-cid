@@ -1,14 +1,10 @@
 #!/usr/bin/env python3
-"""build_org_entries(조직도 트리 평탄화) 단위 테스트.
-requests/pymysql 없이도 돌도록 스텁 주입. 실행: python tests/test_org_entries.py"""
+"""build_org_entries tests: python -m unittest discover -s tests."""
 import os
 import sys
-import types
+import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
-# hiworks_sync 가 import 하는 외부 의존성을 스텁으로 대체(여기선 순수 파싱만 검증)
-sys.modules.setdefault("requests", types.ModuleType("requests"))
-sys.modules.setdefault("pymysql", types.ModuleType("pymysql"))
 from hiworks_sync import build_org_entries  # noqa: E402
 
 # 하이웍스 hrm/v2/organizations 응답 예시(문서 샘플)에 번호만 채운 형태
@@ -50,20 +46,27 @@ EXPECT = {
 }
 
 
-def run():
-    got = build_org_entries(SAMPLE)
-    fails = 0
-    for phone, exp in EXPECT.items():
-        ok = got.get(phone) == exp
-        fails += not ok
-        print(f"{'ok ' if ok else 'FAIL'} {phone} -> {got.get(phone)} (기대 {exp})")
-    extra = set(got) - set(EXPECT)
-    if extra:
-        fails += 1
-        print(f"FAIL 예상 밖 항목: {extra}")
-    print(f"\n{'PASSED' if fails == 0 else f'{fails} FAILED'}")
-    return fails
+class OrgEntriesTests(unittest.TestCase):
+    def test_nested_departments_and_phone_normalization(self):
+        self.assertEqual(build_org_entries(SAMPLE), EXPECT)
+
+    def test_multiple_numbers_and_first_employee_precedence(self):
+        root = {
+            "name": "Department",
+            "entries": [
+                {"name": "First", "cell": "010-1111-2222 / 010-3333-4444", "phone": "02-123-4567"},
+                {"name": "Second", "cell": "01011112222", "phone": ""},
+            ],
+        }
+        self.assertEqual(build_org_entries(root), {
+            "01011112222": ("First", "Department", None),
+            "01033334444": ("First", "Department", None),
+            "021234567": ("First", "Department", None),
+        })
+
+    def test_explicit_empty_department(self):
+        self.assertEqual(build_org_entries({"name": "Department", "entries": []}), {})
 
 
 if __name__ == "__main__":
-    sys.exit(1 if run() else 0)
+    unittest.main()

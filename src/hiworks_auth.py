@@ -21,12 +21,14 @@
 import os
 import sys
 import json
+import tempfile
 import time
 from pathlib import Path
 
+from hiworks_payload import PayloadError, parse_contacts_page
+
 LOGIN_URL = "https://office.hiworks.com/login"
-# 로그인 성공 판정: 이 도메인 쿠키가 잡히면 성공으로 본다
-COOKIE_DOMAIN_HINT = "hiworks.com"
+CONTACTS_API = "https://contact-api.office.hiworks.com/v2/contacts"
 COOKIE_FILE = Path(os.getenv("COOKIE_FILE", "cookies.json"))
 # 쿠키 유효로 간주할 최대 나이(초). 넘으면 재로그인. 12시간 기본.
 MAX_AGE = int(os.getenv("COOKIE_MAX_AGE", str(12 * 3600)))
@@ -55,11 +57,16 @@ def _load_cache():
 
 
 def _save_cache(cookies):
-    COOKIE_FILE.write_text(json.dumps({"ts": time.time(), "cookies": cookies}))
+    fd, name = tempfile.mkstemp(prefix=f".{COOKIE_FILE.name}.", dir=COOKIE_FILE.parent)
     try:
-        os.chmod(COOKIE_FILE, 0o600)
-    except Exception:
-        pass
+        with os.fdopen(fd, "w") as cache:
+            os.fchmod(cache.fileno(), 0o600)
+            json.dump({"ts": time.time(), "cookies": cookies}, cache)
+            cache.flush()
+            os.fsync(cache.fileno())
+        os.replace(name, COOKIE_FILE)
+    finally:
+        Path(name).unlink(missing_ok=True)
 
 
 def _submit(page, sel):
@@ -73,75 +80,96 @@ def _submit(page, sel):
     page.keyboard.press("Enter")
 
 
+def _login_page(page, uid, pw):
+    page.goto(LOGIN_URL, wait_until="domcontentloaded")
+    # 하이웍스 로그인은 2단계(아이디 → 비밀번호) Mantine SPA.
+    id_sel = "input[placeholder*='onhiworks'], input[type='email'], input[type='text']"
+    pw_sel = "input[type='password']"
+    submit = "button[type='submit']"
+    try:
+        page.wait_for_selector(id_sel, timeout=15000)
+    except Exception:
+        try:
+            page.reload(wait_until="domcontentloaded")
+            page.wait_for_selector(id_sel, timeout=15000)
+        except Exception as e:
+            _dump(page, "no-fields")
+            raise LoginError("로그인 폼(아이디 입력칸)을 못 찾음. login-debug-no-fields.* 확인.") from e
+    page.fill(id_sel, uid)
+    if not page.query_selector(pw_sel):
+        _submit(page, submit)
+        try:
+            page.wait_for_selector(pw_sel, timeout=15000)
+        except Exception as e:
+            _dump(page, "no-password")
+            raise LoginError("아이디 다음 단계에서 비밀번호칸을 못 찾음. "
+                             "login-debug-no-password.* 확인.") from e
+    page.fill(pw_sel, pw)
+    _submit(page, submit)
+    try:
+        page.wait_for_load_state("networkidle", timeout=15000)
+    except Exception:
+        pass
+    time.sleep(2)
+
+
+def _authenticated_cookies(ctx):
+    # 같은 브라우저 쿠키로 주소록 조회가 실제로 성공해야 로그인 성공이다.
+    response = ctx.request.get(
+        CONTACTS_API,
+        params={"page[limit]": 1, "page[offset]": 0},
+        headers={"Accept": "application/json"},
+        timeout=15000,
+    )
+    try:
+        if response.status != 200:
+            raise LoginError(f"로그인 후 주소록 인증 확인 실패(HTTP {response.status}).")
+        try:
+            page = parse_contacts_page(response.json())
+            if page.offset != 0 or len(page.rows) != min(page.limit, page.total):
+                raise PayloadError("인증 확인 응답의 페이지 정보가 일치하지 않습니다.")
+        except ValueError as e:
+            raise LoginError("로그인 후 주소록 인증 확인 응답이 올바르지 않습니다.") from e
+    finally:
+        response.dispose()
+    # API URL에 적용되는 쿠키만 저장하여 다른 호스트의 동명 쿠키를 섞지 않는다.
+    cookies = ctx.cookies(CONTACTS_API)
+    if not cookies:
+        raise LoginError("로그인 후 주소록 API에 사용할 쿠키가 없습니다.")
+    return [{"name": c["name"], "value": c["value"], "domain": c["domain"]} for c in cookies]
+
+
 def login_and_get_cookies():
-    from playwright.sync_api import sync_playwright
+    from playwright.sync_api import Error as PlaywrightError, sync_playwright
 
-    uid = os.environ["HIWORKS_ID"]
-    pw = os.environ["HIWORKS_PW"]
-
-    with sync_playwright() as p:
-        # 컨테이너(root/LXC)에서 샌드박스 없이 구동
-        browser = p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage"],
-        )
-        ctx = browser.new_context()
-        page = ctx.new_page()
-        page.goto(LOGIN_URL, wait_until="domcontentloaded")
-
-        # 하이웍스 로그인은 2단계(아이디 → 비밀번호) Mantine SPA.
-        # 1단계 화면엔 아이디 text 입력칸만 있고 제출 버튼은 disabled 상태.
-        ID_SEL = "input[placeholder*='onhiworks'], input[type='email'], input[type='text']"
-        PW_SEL = "input[type='password']"
-        SUBMIT = "button[type='submit']"
-
-        # 1단계: 아이디
-        # SPA가 늦게 뜨면 입력칸을 놓칠 수 있어, 한 번은 reload 후 다시 기다린다.
-        try:
-            page.wait_for_selector(ID_SEL, timeout=15000)
-        except Exception:
+    try:
+        uid = os.environ["HIWORKS_ID"]
+        pw = os.environ["HIWORKS_PW"]
+    except KeyError as e:
+        raise LoginError(f"필수 로그인 환경변수가 없습니다: {e.args[0]}") from e
+    try:
+        with sync_playwright() as p:
+            browser = None
             try:
-                page.reload(wait_until="domcontentloaded")
-                page.wait_for_selector(ID_SEL, timeout=15000)
-            except Exception:
-                _dump(page, "no-fields")
-                browser.close()
-                raise LoginError("로그인 폼(아이디 입력칸)을 못 찾음. login-debug-no-fields.* 확인.")
-        page.fill(ID_SEL, uid)
-
-        # 비밀번호칸이 같은 화면에 없으면 아이디를 제출해 다음 단계로
-        if not page.query_selector(PW_SEL):
-            _submit(page, SUBMIT)
-            try:
-                page.wait_for_selector(PW_SEL, timeout=15000)
-            except Exception:
-                _dump(page, "no-password")
-                browser.close()
-                raise LoginError("아이디 다음 단계에서 비밀번호칸을 못 찾음(아이디 형식/계정 확인). "
-                                 "login-debug-no-password.* 확인.")
-
-        # 2단계: 비밀번호
-        page.fill(PW_SEL, pw)
-        _submit(page, SUBMIT)
-
-        # 로그인 후 리다이렉트/쿠키 대기
-        try:
-            page.wait_for_load_state("networkidle", timeout=15000)
-        except Exception:
-            pass
-        time.sleep(2)
-
-        cookies = ctx.cookies()  # 모든 도메인 쿠키
-        hiworks_cookies = [c for c in cookies if COOKIE_DOMAIN_HINT in c.get("domain", "")]
-
-        if not hiworks_cookies:
-            _dump(page, "login-failed")
-            browser.close()
-            raise LoginError("로그인 실패(쿠키 없음). 자격증명/캡차/차단 여부를 login-debug.* 로 확인하세요.")
-
-        browser.close()
-        # requests 에 쓰기 좋은 형태로 정리
-        return [{"name": c["name"], "value": c["value"], "domain": c["domain"]} for c in hiworks_cookies]
+                # 컨테이너(root/LXC)에서 샌드박스 없이 구동
+                browser = p.chromium.launch(
+                    headless=True,
+                    args=["--no-sandbox", "--disable-dev-shm-usage"],
+                )
+                ctx = browser.new_context()
+                page = ctx.new_page()
+                _login_page(page, uid, pw)
+                try:
+                    return _authenticated_cookies(ctx)
+                except LoginError:
+                    _dump(page, "login-failed")
+                    raise
+            finally:
+                if browser is not None:
+                    browser.close()
+    except PlaywrightError as e:
+        # Playwright TimeoutError도 포함한다. 예외 원문에는 자격증명이 있을 수 있다.
+        raise LoginError(f"브라우저 로그인/인증 확인 실패({type(e).__name__}).") from e
 
 
 def _dump(page, tag):
@@ -154,7 +182,9 @@ def _dump(page, tag):
 
 def _login_with_retry(attempts=None):
     """무인 재로그인 안정화용: LoginError 면 잠깐 쉬고 재시도, 마지막 실패는 그대로 올린다."""
-    attempts = attempts or LOGIN_ATTEMPTS
+    attempts = LOGIN_ATTEMPTS if attempts is None else attempts
+    if attempts < 1:
+        raise LoginError("LOGIN_ATTEMPTS는 1 이상이어야 합니다.")
     last = None
     for i in range(1, attempts + 1):
         try:
@@ -181,6 +211,7 @@ def get_cookie(force=False):
 if __name__ == "__main__":
     # 단독 실행: 강제 로그인 테스트
     try:
-        print(get_cookie(force="--force" in sys.argv)[:40] + "... (쿠키 발급 성공)")
+        get_cookie(force="--force" in sys.argv)
+        print("쿠키 발급 성공")
     except LoginError as e:
         sys.exit(str(e))

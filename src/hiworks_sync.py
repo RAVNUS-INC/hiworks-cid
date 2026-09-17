@@ -29,11 +29,13 @@ import sys
 import json
 import time
 import socket
+import tempfile
 import requests
 import pymysql
 from pathlib import Path
 
 from phone_norm import normalize
+from hiworks_payload import PayloadError, parse_contacts_page, validate_org_tree
 
 API = "https://contact-api.office.hiworks.com/v2/contacts"
 PAGE_LIMIT = 500
@@ -65,6 +67,8 @@ def _get_cookie(force=False):
 def fetch_all():
     cookie = _get_cookie()
     rows, offset, relogged = [], 0, False
+    expected_total = None
+    seen_ids = set()
     while True:
         r = requests.get(
             API,
@@ -81,14 +85,25 @@ def fetch_all():
             relogged = True
             continue
         r.raise_for_status()
-        j = r.json()
-        batch = j.get("data", [])
-        rows.extend(batch)
-        total = (j.get("meta", {}) or {}).get("page", {}).get("total", len(rows))
-        offset += PAGE_LIMIT
-        if offset >= total or not batch:
-            break
-    return rows
+        page = parse_contacts_page(r.json())
+        if page.offset != offset:
+            raise PayloadError("연락처 페이지 offset이 요청한 위치와 다릅니다.")
+        if expected_total is None:
+            expected_total = page.total
+        elif page.total != expected_total:
+            raise PayloadError("연락처 수집 도중 전체 건수가 변경되었습니다. 다음 동기화에서 다시 시도합니다.")
+
+        expected_count = min(page.limit, expected_total - offset)
+        if len(page.rows) != expected_count:
+            raise PayloadError("연락처 페이지 건수가 메타데이터와 일치하지 않습니다.")
+        for row in page.rows:
+            if row["no"] in seen_ids:
+                raise PayloadError("연락처 수집에 중복된 ID가 있습니다. 불완전한 스냅샷을 적용하지 않습니다.")
+            seen_ids.add(row["no"])
+        rows.extend(page.rows)
+        offset += len(page.rows)
+        if offset == expected_total:
+            return rows
 
 
 def build_entries(rows):
@@ -128,11 +143,8 @@ def fetch_org():
         timeout=20,
     )
     r.raise_for_status()
-    j = r.json()
-    # HTTP 200이어도 {code, message} 에러 봉투가 올 수 있음 → 명시적으로 실패 처리
-    if isinstance(j, dict) and "entries" not in j and "nodes" not in j:
-        raise RuntimeError(f"조직도 API 오류 응답: code={j.get('code')} message={j.get('message')}")
-    return j
+    # null/[] 등도 비활성화로 해석하지 않는다. 토큰 미설정만 None을 반환한다.
+    return validate_org_tree(r.json())
 
 
 def build_org_entries(root):
@@ -204,10 +216,26 @@ def _load_state():
 
 
 def _save_state(state):
+    temporary = None
     try:
-        STATE_FILE.write_text(json.dumps(state))
+        # /health가 읽는 동안 파일을 비우지 않도록 같은 디렉터리에서 원자적으로 교체한다.
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=STATE_FILE.parent,
+            prefix=f".{STATE_FILE.name}.", suffix=".tmp", delete=False,
+        ) as stream:
+            temporary = Path(stream.name)
+            json.dump(state, stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, STATE_FILE)
     except Exception as e:
         print(f"상태파일 기록 실패: {e}", file=sys.stderr)
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError as e:
+                print(f"임시 상태파일 삭제 실패: {e}", file=sys.stderr)
 
 
 def _heartbeat():
@@ -238,7 +266,7 @@ def main():
         # 조직도(직원). 토큰 미설정이면 None → 공유주소록만.
         # 실패 시 전체 실패로 처리(부분 성공으로 직원이 스냅샷에서 사라지는 것 방지).
         org = fetch_org()
-        employees = build_org_entries(org) if org else {}
+        employees = build_org_entries(org) if org is not None else {}
         # 같은 번호가 양쪽에 있으면 직원(조직도) 우선
         merged = {**contacts, **employees}
         entries = [(p, n, co, g) for p, (n, co, g) in merged.items()]

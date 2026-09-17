@@ -36,8 +36,8 @@
 | `src/hiworks_sync.py` | 연락처 전체 조회 → MySQL `cid_lookup` upsert (401 시 자동 재로그인) |
 | `src/http_lookup.py` | 조회 HTTP 엔드포인트 (`/cid?number=...`, OpenCNAM 호환 경로 포함) |
 | `schema.sql` | MySQL 테이블/계정 |
-| `deploy/` | `install.sh`, `update.sh`, systemd 유닛, `.env` 예시 |
-| `asterisk/asterisk-cid.conf` | Asterisk 연동 스니펫 (func_odbc / CURL 예시) |
+| `deploy/` | `install.sh`, `update.sh`, `migrate.py`, systemd 유닛, `.env` 예시 |
+| `asterisk/asterisk-cid.conf` | Asterisk func_odbc 연동 스니펫 (HTTP 예시는 아래 참고) |
 
 ## 요구 사항
 
@@ -47,26 +47,37 @@
 
 ## 설치
 
+서버에서 root로 실행합니다. 최초 실행은 설정 파일만 만들고 종료 코드 1로 중단합니다.
+
 ```bash
 git clone https://github.com/<your-org>/hiworks-cid.git /opt/hiworks
 bash /opt/hiworks/deploy/install.sh
+nano /etc/hiworks-sync.env           # 실제 하이웍스/DB 자격증명 입력
+bash /opt/hiworks/deploy/install.sh  # 설정을 채운 뒤 다시 실행
 ```
 
-`install.sh` 가 하는 일: 패키지 설치 → Python venv + 의존성 + Chromium → MySQL 스키마/계정 →
-systemd 유닛(조회 서비스 상시 + 동기화 타이머 30분) 등록.
+`install.sh`는 필수 설정의 빈 값·예시 값을 먼저 확인하고, 설정이 준비되면 패키지 → Python venv +
+의존성 + Chromium → MySQL 스키마/계정 → systemd 유닛(조회 서비스 상시 + 동기화 타이머 2분)을
+설치합니다. DB 계정은 없을 때만 생성하며 기존 계정의 비밀번호를 변경하지 않습니다.
 
 ## 설정
 
 `/etc/hiworks-sync.env` (권한 600) 를 채웁니다. 예시는 `deploy/hiworks-sync.env.example` 참고.
 
-```
-HIWORKS_ID=api@yourcompany.com     # 하이웍스 전용 계정(주소록 읽기 권한)
-HIWORKS_PW=********                 # 비밀번호 — 이 파일에만, 커밋 금지
+```bash
+# 하이웍스 전용 계정(주소록 읽기 권한). 아래 예시를 실제 값으로 바꾸세요.
+HIWORKS_ID='api@yourcompany.com'
+HIWORKS_PW='여기에_전용계정_비밀번호'
 MYSQL_HOST=127.0.0.1
 MYSQL_USER=hiworks_sync
-MYSQL_PASSWORD=********
+MYSQL_PASSWORD='여기에_MySQL_비밀번호'
 MYSQL_DB=asterisk
 ```
+
+이 파일은 셸과 systemd가 함께 읽으므로 값에 공백이나 `$` 같은 문자가 있으면 인용 부호로
+감싸고, 주석은 별도 줄에 적습니다. 배포 스크립트는 로컬 MariaDB(3306)에 root Unix 소켓으로
+관리 접속합니다. 소켓 경로가 다르면 `MYSQL_ADMIN_SOCKET`을 설정하세요
+(기본 `/run/mysqld/mysqld.sock`). 원격 DB의 계정 생성·스키마 변경은 해당 DB 관리자가 수행해야 합니다.
 
 > 팁: 하이웍스 로그인은 SPA라 폼 셀렉터가 환경에 따라 다를 수 있습니다. 로그인 실패 시
 > `login-debug-*.png/html` 이 생성되니, 이를 참고해 `src/hiworks_auth.py` 상단의
@@ -75,16 +86,25 @@ MYSQL_DB=asterisk
 ## 실행 / 테스트
 
 ```bash
+cd /opt/hiworks
 set -a; . /etc/hiworks-sync.env; set +a
-python src/hiworks_auth.py --force                 # 로그인/쿠키 발급 확인
-python src/hiworks_sync.py                          # 동기화
+venv/bin/python src/hiworks_auth.py --force         # 로그인/쿠키 발급 확인
+venv/bin/python src/hiworks_sync.py                 # 동기화
 mysql -e "SELECT COUNT(*) FROM asterisk.cid_lookup;"
 curl "http://127.0.0.1:8088/cid?number=01012345678"
 ```
 
+로컬 회귀 테스트는 프로젝트 루트에서 실행합니다. 배포 테스트는 패키지 설치·서비스 명령과 DB를
+모의 처리하므로 운영 자원을 변경하지 않습니다.
+
+```bash
+python3 -m unittest discover -s tests -v
+bash -n deploy/install.sh deploy/update.sh
+```
+
 ## Asterisk 연동
 
-`asterisk/asterisk-cid.conf` 참고. 별도 서버 구성에서는 HTTP 조회가 가장 간단합니다.
+별도 서버 구성에서는 아래 HTTP 조회 예시를 사용합니다.
 
 ```
 ; extensions.conf — LOOKUP_HOST 는 이 서버의 IP
@@ -93,13 +113,33 @@ exten => _X.,1,Set(NUM=${FILTER(0-9,${CALLERID(num)})})
  same => n,ExecIf($["${FOUND}"!=""]?Set(CALLERID(name)=${FOUND}))
 ```
 
-로컬 MySQL 직결(func_odbc)을 쓰려면 같은 파일의 ODBC 예시를 참고하세요.
+로컬 MySQL 직결(func_odbc)을 쓰려면 `asterisk/asterisk-cid.conf`를 참고하세요.
 
 ## 갱신
 
 ```bash
-bash /opt/hiworks/deploy/update.sh   # git pull → 의존성/유닛 반영 → 재시작 + 즉시 1회 동기화
+bash /opt/hiworks/deploy/update.sh
 ```
+
+`git pull` → 의존성 반영 → 앱 DB 인증 확인 → 스키마 마이그레이션 → 유닛 반영 → 조회 서비스
+재시작 → 즉시 1회 동기화 순서로 진행합니다. 인증이나 마이그레이션 실패 시 서비스 재시작 전에
+중단합니다. `grade`가 없는 기존 테이블은 먼저 덤프를 저장하고 컬럼을 추가하며, 이미 있으면
+변경하지 않습니다. 백업 위치는 `/var/backups/hiworks-cid/`이고 파일 권한은 600입니다
+(`MIGRATION_BACKUP_DIR`로 변경 가능). 백업 실패 시 컬럼도 변경하지 않습니다.
+
+DB 인증이 실패하면 `/etc/hiworks-sync.env`의 DB명·계정·비밀번호를 기존 DB 설정과 대조하세요.
+예전 설치에서 예시 비밀번호로 계정이 만들어졌다면 env 편집이나 스크립트 재실행만으로 DB
+비밀번호가 바뀌지 않습니다. 기존 비밀번호를 확인할 수 있으면 env를 일치시키고, 확인할 수
+없으면 DB 관리자가 의도적으로 비밀번호를 재설정한 다음 env에도 같은 값을 넣습니다.
+자격증명을 명령행 인자로 전달하지 말고 아래 명령의 비밀번호 프롬프트로 접속을 확인하세요.
+
+```bash
+mariadb --host=127.0.0.1 --user=hiworks_sync --password asterisk
+```
+
+배포 전 코드 버전과 설정을 별도로 백업하세요. 코드 롤백 시 추가된 nullable `grade` 컬럼은
+그대로 둘 수 있습니다. 데이터 복구가 필요한 경우 동기화를 중지하고 현재 DB도 백업한 뒤,
+관리자가 덤프를 검토하여 복원해야 합니다. 덤프 복원은 현재 연락처를 덮어씁니다.
 
 ## 자동 로그인 / 쿠키 갱신
 
