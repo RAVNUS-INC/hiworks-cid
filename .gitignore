@@ -2,6 +2,7 @@ venv/
 cookies.json
 login-debug-*
 sync_state.json
+contact_details.json
 HANDOFF.md
 *.pyc
 __pycache__/

@@ -3,6 +3,7 @@
 import contextlib
 import io
 import json
+import stat
 import sys
 import tempfile
 import unittest
@@ -12,7 +13,7 @@ from unittest.mock import Mock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import hiworks_sync as sync
 from hiworks_payload import PayloadError
-from test_payload import contact, contacts_page
+from test_payload import contact, contact_detail, contacts_page
 
 
 def response(payload, status=200):
@@ -89,6 +90,94 @@ class FetchContactsTests(unittest.TestCase):
             sync.fetch_all()
 
 
+class ContactDetailsTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.cache = Path(self.temp.name) / "contact_details.json"
+        self.row = contact(7)
+        self.row["updated_at"] = "2026-09-18T00:00:00"
+        patches = [
+            patch.object(sync, "DETAIL_CACHE_FILE", self.cache),
+            patch.object(sync, "DETAIL_CACHE_MAX_AGE", 3600),
+            patch.object(sync, "DETAIL_WORKERS", 1),
+            patch.object(sync.time, "time", return_value=1_000),
+        ]
+        for patcher in patches:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_detail_request_uses_required_headers_and_builds_every_phone_type(self):
+        phones = [
+            {"type": "휴대폰", "phone": "010-1111-2222", "is_default": True},
+            {"type": "회사전화", "phone": "02-1234-5678", "is_default": False},
+            {"type": "팩스", "phone": "02-9876-5432", "is_default": False},
+            {"type": "기타", "phone": "1588-0000", "is_default": False},
+        ]
+        with patch.object(sync.requests, "get", return_value=response(contact_detail(7, phones))) as get:
+            actual = sync._fetch_contact_detail(self.row, "session=secret")
+        self.assertEqual(actual, phones)
+        self.assertEqual(get.call_args.args[0], f"{sync.API}/7")
+        self.assertEqual(get.call_args.kwargs["headers"], {
+            "Cookie": "session=secret", "Accept": "application/json", "type": "shared",
+            "Origin": sync.CONTACT_WEB_ORIGIN, "Referer": f"{sync.CONTACT_WEB_ORIGIN}/",
+        })
+        entries = sync.build_entries([self.row], {7: phones})
+        self.assertEqual(set(entries), {"01011112222", "0212345678", "0298765432", "15880000"})
+
+    def test_unchanged_private_cache_avoids_detail_requests(self):
+        phones = [{"type": "휴대폰", "phone": "01011112222", "is_default": True}]
+        sync._save_detail_cache({"7": {
+            "updated_at": self.row["updated_at"], "fetched_at": 999, "phones": phones,
+        }})
+        with patch.object(sync, "_get_cookie") as cookie, patch.object(sync.requests, "get") as get:
+            self.assertEqual(sync.fetch_contact_phones([self.row]), {7: phones})
+        cookie.assert_not_called()
+        get.assert_not_called()
+        self.assertEqual(stat.S_IMODE(self.cache.stat().st_mode), 0o600)
+
+    def test_changed_contact_refreshes_cache(self):
+        old_phones = [{"type": "휴대폰", "phone": "01011112222", "is_default": True}]
+        new_phones = [
+            *old_phones,
+            {"type": "회사전화", "phone": "02-1234-5678", "is_default": False},
+        ]
+        sync._save_detail_cache({"7": {
+            "updated_at": "old", "fetched_at": 999, "phones": old_phones,
+        }})
+        with patch.object(sync, "_get_cookie", return_value="session=secret"), \
+                patch.object(sync.requests, "get", return_value=response(contact_detail(7, new_phones))) as get:
+            self.assertEqual(sync.fetch_contact_phones([self.row]), {7: new_phones})
+        self.assertEqual(get.call_count, 1)
+        saved = json.loads(self.cache.read_text())
+        self.assertEqual(saved["contacts"]["7"]["phones"], new_phones)
+        self.assertEqual(saved["contacts"]["7"]["updated_at"], self.row["updated_at"])
+
+    def test_partial_detail_never_replaces_existing_cache(self):
+        old = {"version": 1, "contacts": {"7": {
+            "updated_at": "old", "fetched_at": 999,
+            "phones": [{"type": "휴대폰", "phone": "01011112222", "is_default": True}],
+        }}}
+        self.cache.write_text(json.dumps(old))
+        incomplete = contact_detail(7, [
+            {"type": "회사전화", "phone": "02-1234-5678", "is_default": True},
+        ])
+        with patch.object(sync, "_get_cookie", return_value="session=secret"), \
+                patch.object(sync.requests, "get", return_value=response(incomplete)):
+            with self.assertRaises(PayloadError):
+                sync.fetch_contact_phones([self.row])
+        self.assertEqual(json.loads(self.cache.read_text()), old)
+
+    def test_authentication_failures_relogin_once(self):
+        phones = [{"type": "휴대폰", "phone": "01011112222", "is_default": True}]
+        first = response(None, 401)
+        second = response(contact_detail(7, phones))
+        with patch.object(sync, "_get_cookie", side_effect=["old", "new"]) as cookie, \
+                patch.object(sync.requests, "get", side_effect=[first, second]):
+            self.assertEqual(sync.fetch_contact_phones([self.row]), {7: phones})
+        self.assertEqual(cookie.call_args_list[1].kwargs, {"force": True})
+
+
 class SnapshotSafetyTests(unittest.TestCase):
     def setUp(self):
         self.resources = contextlib.ExitStack()
@@ -98,6 +187,15 @@ class SnapshotSafetyTests(unittest.TestCase):
         self.state_file.write_text(json.dumps({"fails": 0, "last_success": 12345}))
         self.resources.enter_context(patch.object(sync, "STATE_FILE", self.state_file))
         self.resources.enter_context(patch.object(sync, "_get_cookie", return_value="synthetic-cookie"))
+        self.resources.enter_context(patch.object(
+            sync, "fetch_contact_phones",
+            side_effect=lambda rows: {
+                row["no"]: [{"type": "기본", "phone": row["phone"], "is_default": True}]
+                for row in rows
+                if row.get("type") == "shared" and not row.get("owner")
+                and (row.get("name") or "").strip()
+            },
+        ))
         self.http = self.resources.enter_context(patch.object(sync.requests, "get"))
         self.database = self.resources.enter_context(patch.object(sync, "sync_mysql"))
         self.heartbeat = self.resources.enter_context(patch.object(sync, "_heartbeat"))

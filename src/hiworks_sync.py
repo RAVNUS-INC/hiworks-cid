@@ -32,13 +32,23 @@ import socket
 import tempfile
 import requests
 import pymysql
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from phone_norm import normalize
-from hiworks_payload import PayloadError, parse_contacts_page, validate_org_tree
+from hiworks_payload import (
+    PayloadError,
+    parse_contact_detail,
+    parse_contacts_page,
+    validate_org_tree,
+)
 
 API = "https://contact-api.office.hiworks.com/v2/contacts"
 PAGE_LIMIT = 500
+CONTACT_WEB_ORIGIN = "https://address-book.office.hiworks.com"
+DETAIL_CACHE_FILE = Path(os.getenv("CONTACT_DETAIL_CACHE_FILE", "contact_details.json"))
+DETAIL_CACHE_MAX_AGE = int(os.getenv("CONTACT_DETAIL_CACHE_MAX_AGE", "86400"))
+DETAIL_WORKERS = int(os.getenv("CONTACT_DETAIL_WORKERS", "6"))
 
 # 조직도(직원) 동기화 — Open API Bearer 토큰. 미설정이면 공유주소록만 동기화.
 ORG_TOKEN = os.getenv("HIWORKS_OFFICE_TOKEN")
@@ -106,8 +116,147 @@ def fetch_all():
             return rows
 
 
-def build_entries(rows):
-    """공유주소록 -> {phone: (name, company, grade)}. 한 연락처에 번호가 여러 개면 분해."""
+class DetailAuthenticationError(RuntimeError):
+    """A contact-detail request needs a refreshed browser session."""
+
+
+def _load_detail_cache():
+    """Load the private detail cache. Malformed/old formats are treated as empty."""
+    try:
+        payload = json.loads(DETAIL_CACHE_FILE.read_text())
+        if payload.get("version") != 1 or not isinstance(payload.get("contacts"), dict):
+            return {}
+        return payload["contacts"]
+    except Exception:
+        return {}
+
+
+def _save_detail_cache(contacts):
+    """Atomically save contact phone details with private file permissions."""
+    temporary = None
+    try:
+        DETAIL_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=DETAIL_CACHE_FILE.parent,
+            prefix=f".{DETAIL_CACHE_FILE.name}.", suffix=".tmp", delete=False,
+        ) as stream:
+            temporary = Path(stream.name)
+            os.fchmod(stream.fileno(), 0o600)
+            json.dump({"version": 1, "contacts": contacts}, stream, ensure_ascii=False)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, DETAIL_CACHE_FILE)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def _cached_detail(cache, row, now):
+    entry = cache.get(str(row["no"]))
+    if not isinstance(entry, dict) or entry.get("updated_at") != row.get("updated_at"):
+        return None
+    fetched_at = entry.get("fetched_at")
+    if type(fetched_at) not in (int, float) or not 0 <= now - fetched_at <= DETAIL_CACHE_MAX_AGE:
+        return None
+    phones = entry.get("phones")
+    if not isinstance(phones, list):
+        return None
+    for phone in phones:
+        if not isinstance(phone, dict) or not isinstance(phone.get("type"), str) \
+                or not isinstance(phone.get("phone"), str) \
+                or type(phone.get("is_default")) is not bool:
+            return None
+    return phones
+
+
+def _fetch_contact_detail(row, cookie):
+    response = requests.get(
+        f"{API}/{row['no']}",
+        headers={
+            "Cookie": cookie,
+            "Accept": "application/json",
+            # The undocumented detail endpoint returns HTTP 500 without this custom header.
+            "type": row["type"],
+            "Origin": CONTACT_WEB_ORIGIN,
+            "Referer": f"{CONTACT_WEB_ORIGIN}/",
+        },
+        timeout=20,
+    )
+    if response.status_code in (401, 403):
+        raise DetailAuthenticationError("연락처 상세 인증이 만료되었습니다.")
+    response.raise_for_status()
+    detail = parse_contact_detail(response.json(), expected_no=row["no"])
+    phones = detail["phones"]
+    # A partial detail response must never silently remove the primary list number.
+    listed = normalize(row.get("phone"))
+    detailed = {normalize(phone["phone"]) for phone in phones}
+    if listed and listed not in detailed:
+        raise PayloadError("연락처 상세에 목록의 대표 전화번호가 없습니다.")
+    return phones
+
+
+def _fetch_detail_batch(rows, cookie):
+    results, errors = {}, {}
+    workers = min(max(DETAIL_WORKERS, 1), max(len(rows), 1))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(_fetch_contact_detail, row, cookie): row for row in rows}
+        for future in as_completed(futures):
+            row = futures[future]
+            try:
+                results[row["no"]] = future.result()
+            except Exception as error:
+                errors[row["no"]] = error
+    return results, errors
+
+
+def fetch_contact_phones(rows):
+    """Return {contact_no: phones[]} from detail API, reusing unchanged private cache entries."""
+    if DETAIL_CACHE_MAX_AGE <= 0 or DETAIL_WORKERS <= 0:
+        raise ValueError("CONTACT_DETAIL_CACHE_MAX_AGE와 CONTACT_DETAIL_WORKERS는 양수여야 합니다.")
+    eligible = [
+        row for row in rows
+        if row.get("type") == "shared" and not row.get("owner") and (row.get("name") or "").strip()
+    ]
+    now = time.time()
+    old_cache = _load_detail_cache()
+    phones_by_contact, cache_entries, pending = {}, {}, []
+    for row in eligible:
+        cached = _cached_detail(old_cache, row, now)
+        if cached is None:
+            pending.append(row)
+            continue
+        phones_by_contact[row["no"]] = cached
+        cache_entries[str(row["no"])] = old_cache[str(row["no"])]
+
+    if pending:
+        fetched, errors = _fetch_detail_batch(pending, _get_cookie())
+        authentication_rows = [row for row in pending if isinstance(errors.get(row["no"]), DetailAuthenticationError)]
+        other_errors = [error for error in errors.values() if not isinstance(error, DetailAuthenticationError)]
+        if other_errors:
+            raise other_errors[0]
+        if authentication_rows:
+            retried, retry_errors = _fetch_detail_batch(authentication_rows, _get_cookie(force=True))
+            fetched.update(retried)
+            if retry_errors:
+                error = next(iter(retry_errors.values()))
+                if isinstance(error, DetailAuthenticationError):
+                    raise RuntimeError("재로그인 후에도 연락처 상세 인증에 실패했습니다.") from error
+                raise error
+        for row in pending:
+            phones = fetched[row["no"]]
+            phones_by_contact[row["no"]] = phones
+            cache_entries[str(row["no"])] = {
+                "updated_at": row.get("updated_at"),
+                "fetched_at": now,
+                "phones": phones,
+            }
+
+    _save_detail_cache(cache_entries)
+    return phones_by_contact
+
+
+def build_entries(rows, phones_by_contact=None):
+    """공유주소록 -> {phone: (name, company, grade)}. 상세의 모든 번호를 각각 등록."""
     seen = {}
     for c in rows:
         # 공유주소록만 동기화 (개인 소유 항목은 제외).
@@ -119,12 +268,19 @@ def build_entries(rows):
             continue
         company = (c.get("company") or "").strip() or None
         grade = (c.get("grade") or "").strip() or None
-        # phone 필드는 단일 문자열이지만 여러 번호가 섞여 올 수 있어 구분자로 분해
-        for part in re.split(r"[,/;\n]", c.get("phone") or ""):
-            p = normalize(part)
-            if p:
-                # 먼저 들어온 값 우선(중복 번호는 첫 이름 유지)
-                seen.setdefault(p, (name, company, grade))
+        if phones_by_contact is None:
+            raw_phones = [c.get("phone") or ""]
+        else:
+            if c["no"] not in phones_by_contact:
+                raise PayloadError("공유 연락처의 상세 전화번호가 누락되었습니다.")
+            raw_phones = [phone["phone"] for phone in phones_by_contact[c["no"]]]
+        for raw_phone in raw_phones:
+            # 각 상세 번호 안에 구분자로 여러 번호가 들어간 기존 데이터도 호환한다.
+            for part in re.split(r"[,/;\n]", raw_phone):
+                p = normalize(part)
+                if p:
+                    # 먼저 들어온 값 우선(중복 번호는 첫 이름 유지)
+                    seen.setdefault(p, (name, company, grade))
     return seen
 
 
@@ -262,7 +418,8 @@ def _send_alert(payload):
 def main():
     try:
         rows = fetch_all()
-        contacts = build_entries(rows)
+        phones_by_contact = fetch_contact_phones(rows)
+        contacts = build_entries(rows, phones_by_contact)
         # 조직도(직원). 토큰 미설정이면 None → 공유주소록만.
         # 실패 시 전체 실패로 처리(부분 성공으로 직원이 스냅샷에서 사라지는 것 방지).
         org = fetch_org()
@@ -289,7 +446,9 @@ def main():
     if prev >= ALERT_AFTER_FAILURES:
         _send_alert({"status": "recovered", "after_failures": prev})
     emp_note = f" (직원 {len(employees)}번호 포함)" if employees else ""
-    print(f"동기화 완료: 연락처 {len(rows)}건 -> 번호 {len(entries)}건 적재{emp_note}")
+    detail_numbers = sum(len(phones) for phones in phones_by_contact.values())
+    print(f"동기화 완료: 연락처 {len(rows)}건/상세번호 {detail_numbers}건 -> "
+          f"고유번호 {len(entries)}건 적재{emp_note}")
 
 
 if __name__ == "__main__":

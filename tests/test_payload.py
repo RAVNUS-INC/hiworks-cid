@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from hiworks_payload import PayloadError, parse_contacts_page, validate_org_tree
+from hiworks_payload import PayloadError, parse_contact_detail, parse_contacts_page, validate_org_tree
 
 
 def contact(number=1):
@@ -21,6 +21,17 @@ def contacts_page(rows=None, *, limit=500, offset=0, total=None):
     return {
         "meta": {"page": {"limit": limit, "offset": offset, "total": len(rows) if total is None else total}},
         "data": rows,
+    }
+
+
+def contact_detail(number=1, phones=None):
+    return {
+        "data": {
+            "no": number,
+            "phones": phones if phones is not None else [
+                {"type": "휴대폰", "phone": "01011112222", "is_default": True},
+            ],
+        },
     }
 
 
@@ -70,6 +81,31 @@ class ContactsPayloadTests(unittest.TestCase):
         del row["company"]
         row["grade"] = None
         self.assertEqual(parse_contacts_page(contacts_page([row])).rows, [row])
+
+
+class ContactDetailPayloadTests(unittest.TestCase):
+    def test_returns_all_phone_types(self):
+        payload = contact_detail(7, [
+            {"type": "휴대폰", "phone": "010-1111-2222", "is_default": True},
+            {"type": "회사전화", "phone": "02-1234-5678", "is_default": False},
+            {"type": "팩스", "phone": "02-9876-5432", "is_default": False},
+            {"type": "기타", "phone": "1588-0000", "is_default": False},
+        ])
+        self.assertEqual(parse_contact_detail(payload, expected_no=7)["phones"], payload["data"]["phones"])
+
+    def test_rejects_wrong_contact_or_invalid_phone_shape(self):
+        with self.assertRaises(PayloadError):
+            parse_contact_detail(contact_detail(2), expected_no=1)
+        invalid = [None, {}, {"data": {}}, contact_detail()]
+        invalid[-1]["data"]["phones"] = None
+        for payload in invalid:
+            with self.subTest(payload=payload), self.assertRaises(PayloadError):
+                parse_contact_detail(payload)
+        for field, value in (("type", None), ("phone", []), ("is_default", 1)):
+            payload = contact_detail()
+            payload["data"]["phones"][0][field] = value
+            with self.subTest(field=field), self.assertRaises(PayloadError):
+                parse_contact_detail(payload)
 
 
 class OrganizationPayloadTests(unittest.TestCase):

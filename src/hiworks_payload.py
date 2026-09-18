@@ -63,6 +63,24 @@ def parse_contacts_page(payload):
     return ContactsPage(rows=rows, limit=limit, offset=offset, total=total)
 
 
+def parse_contact_detail(payload, expected_no=None):
+    """Return one validated contact detail including every saved phone number."""
+    root = _object(payload, "연락처 상세 응답")
+    row = _object(root.get("data"), "연락처 상세 data")
+    contact_no = _integer(row.get("no"), "연락처 상세 data.no", 0)
+    if expected_no is not None and contact_no != expected_no:
+        raise PayloadError("연락처 상세 ID가 요청한 연락처와 다릅니다.")
+    phones = _array(row.get("phones"), "연락처 상세 data.phones")
+    for index, value in enumerate(phones):
+        location = f"연락처 상세 data.phones[{index}]"
+        phone = _object(value, location)
+        for field in ("type", "phone"):
+            _string_field(phone, field, location)
+        if type(phone.get("is_default")) is not bool:
+            raise PayloadError(f"{location}.is_default: 불리언이 필요합니다.")
+    return row
+
+
 def validate_org_tree(payload):
     """Validate every department and employee, including an explicitly empty tree."""
     def walk(value, location):

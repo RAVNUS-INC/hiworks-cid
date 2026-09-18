@@ -24,7 +24,8 @@
                                                                     └── CURL() / func_odbc
 ```
 
-- `hiworks_sync.py` 가 전용 계정으로 로그인해 연락처 전체를 가져와 `cid_lookup` 테이블에 upsert
+- `hiworks_sync.py` 가 전용 계정으로 로그인해 연락처 목록과 각 연락처의 상세 전화번호
+  (휴대폰·회사전화·팩스·기타)를 가져와 `cid_lookup` 테이블에 번호별로 upsert
 - Asterisk 는 통화마다 이 서버의 HTTP 엔드포인트(기본 `:8088`)를 조회해 `CALLERID(name)` 를 채움
 - 통화 경로에 하이웍스를 직접 두지 않으므로 빠르고, 하이웍스가 잠깐 죽어도 발신자 표시는 계속 동작
 
@@ -79,6 +80,12 @@ MYSQL_DB=asterisk
 관리 접속합니다. 소켓 경로가 다르면 `MYSQL_ADMIN_SOCKET`을 설정하세요
 (기본 `/run/mysqld/mysqld.sock`). 원격 DB의 계정 생성·스키마 변경은 해당 DB 관리자가 수행해야 합니다.
 
+주소록 목록 API는 대표 전화번호 하나만 반환하므로 동기화는 연락처 상세 API도 조회합니다. 상세 결과는
+기본 `/opt/hiworks/contact_details.json`에 권한 600으로 저장하며, `updated_at`이 바뀐 연락처만 즉시
+다시 조회합니다. 변경 시각이 그대로인 예외에 대비해 하루마다 전체 상세를 갱신합니다. 경로·갱신 주기·
+동시 요청 수는 `CONTACT_DETAIL_CACHE_FILE`, `CONTACT_DETAIL_CACHE_MAX_AGE`,
+`CONTACT_DETAIL_WORKERS`로 조정할 수 있습니다.
+
 > 팁: 하이웍스 로그인은 SPA라 폼 셀렉터가 환경에 따라 다를 수 있습니다. 로그인 실패 시
 > `login-debug-*.png/html` 이 생성되니, 이를 참고해 `src/hiworks_auth.py` 상단의
 > `id_selectors`/`pw_selectors` 를 조정하세요.
@@ -90,7 +97,7 @@ cd /opt/hiworks
 set -a; . /etc/hiworks-sync.env; set +a
 venv/bin/python src/hiworks_auth.py --force         # 로그인/쿠키 발급 확인
 venv/bin/python src/hiworks_sync.py                 # 동기화
-mysql -e "SELECT COUNT(*) FROM asterisk.cid_lookup;"
+mysql -e "SELECT COUNT(*) FROM asterisk.cid_lookup;"  # 연락처 수가 아니라 고유 전화번호 수
 curl "http://127.0.0.1:8088/cid?number=01012345678"
 ```
 
