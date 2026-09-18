@@ -64,7 +64,7 @@ def parse_contacts_page(payload):
 
 
 def parse_contact_detail(payload, expected_no=None):
-    """Return one validated contact detail including every saved phone number."""
+    """Return one validated contact detail including every multi-value field."""
     root = _object(payload, "연락처 상세 응답")
     row = _object(root.get("data"), "연락처 상세 data")
     contact_no = _integer(row.get("no"), "연락처 상세 data.no", 0)
@@ -78,6 +78,25 @@ def parse_contact_detail(payload, expected_no=None):
             _string_field(phone, field, location)
         if type(phone.get("is_default")) is not bool:
             raise PayloadError(f"{location}.is_default: 불리언이 필요합니다.")
+    emails = _array(row.get("emails"), "연락처 상세 data.emails")
+    for index, value in enumerate(emails):
+        location = f"연락처 상세 data.emails[{index}]"
+        email = _object(value, location)
+        _string_field(email, "email", location)
+        if type(email.get("is_default")) is not bool:
+            raise PayloadError(f"{location}.is_default: 불리언이 필요합니다.")
+    _array(row.get("addresses"), "연락처 상세 data.addresses")
+    _array(row.get("tags"), "연락처 상세 data.tags")
+
+    for field in (
+        "name", "company", "department", "grade", "homepage", "calendar_type",
+        "birth", "memo", "type", "updater", "created_at", "updated_at", "image",
+    ):
+        if field in row:
+            _string_field(row, field, "연락처 상세 data", optional=True)
+    for field in ("allow_editing", "is_star", "is_owner"):
+        if field in row and row[field] is not None and type(row[field]) is not bool:
+            raise PayloadError(f"연락처 상세 data.{field}: 불리언이 필요합니다.")
     return row
 
 

@@ -24,8 +24,8 @@
                                                                     └── CURL() / func_odbc
 ```
 
-- `hiworks_sync.py` 가 전용 계정으로 로그인해 연락처 목록과 각 연락처의 상세 전화번호
-  (휴대폰·회사전화·팩스·기타)를 가져와 `cid_lookup` 테이블에 번호별로 upsert
+- `hiworks_sync.py` 가 전용 계정으로 로그인해 연락처 목록과 상세 데이터 전체를 원본 미러 테이블에
+  저장하고, 전화번호(휴대폰·회사전화·팩스·기타)로 `cid_lookup`을 생성
 - Asterisk 는 통화마다 이 서버의 HTTP 엔드포인트(기본 `:8088`)를 조회해 `CALLERID(name)` 를 채움
 - 통화 경로에 하이웍스를 직접 두지 않으므로 빠르고, 하이웍스가 잠깐 죽어도 발신자 표시는 계속 동작
 
@@ -80,11 +80,33 @@ MYSQL_DB=asterisk
 관리 접속합니다. 소켓 경로가 다르면 `MYSQL_ADMIN_SOCKET`을 설정하세요
 (기본 `/run/mysqld/mysqld.sock`). 원격 DB의 계정 생성·스키마 변경은 해당 DB 관리자가 수행해야 합니다.
 
-주소록 목록 API는 대표 전화번호 하나만 반환하므로 동기화는 연락처 상세 API도 조회합니다. 상세 결과는
+주소록 목록 API는 대표 전화번호 하나만 반환하므로 동기화는 연락처 상세 API도 조회합니다. 전체 상세 결과는
 기본 `/opt/hiworks/contact_details.json`에 권한 600으로 저장하며, `updated_at`이 바뀐 연락처만 즉시
 다시 조회합니다. 변경 시각이 그대로인 예외에 대비해 하루마다 전체 상세를 갱신합니다. 경로·갱신 주기·
 동시 요청 수는 `CONTACT_DETAIL_CACHE_FILE`, `CONTACT_DETAIL_CACHE_MAX_AGE`,
 `CONTACT_DETAIL_WORKERS`로 조정할 수 있습니다.
+
+## 저장 데이터와 CID 중복 정책
+
+동기화는 하이웍스의 현재 공유주소록을 다음 테이블에 원자적으로 반영합니다. 하이웍스에서 삭제된
+연락처는 다음 성공 동기화 때 미러에서도 삭제됩니다.
+
+| 테이블 | 내용 |
+|------|------|
+| `hiworks_contacts` | 이름·회사·부서·직급·홈페이지·메모·원본 시각 및 목록/상세 원문 JSON |
+| `hiworks_contact_phones` | 모든 전화번호, 번호 종류, 기본번호 여부, 정규화 번호 |
+| `hiworks_contact_emails` | 모든 이메일과 기본 이메일 여부 |
+| `hiworks_contact_addresses` | 주소 원문 |
+| `hiworks_contact_tags` | 태그 원문 |
+| `hiworks_organization_snapshot` | 조직도 API 전체 응답 |
+| `cid_lookup` | Asterisk가 읽는 번호별 CID 파생 결과 |
+
+원문 JSON도 저장하므로 하이웍스가 새 필드를 추가해도 응답에 포함된 값은 보존됩니다. 전화번호가 없는
+연락처도 `hiworks_contacts`에는 남고, `cid_lookup`에만 포함되지 않습니다.
+
+같은 번호가 여러 연락처에 있으면 임의의 첫 사람을 선택하지 않습니다. 회사번호·팩스 등은 같은 회사로
+판단될 때 회사명으로 표시하고, 여러 회사가 섞이면 `공용번호`로 표시합니다. 휴대폰 중복은 이름이 같으면
+동일 인물로 처리하고 이름이 다르면 `중복 연락처`로 표시하며 동기화 결과에 충돌 건수를 남깁니다.
 
 > 팁: 하이웍스 로그인은 SPA라 폼 셀렉터가 환경에 따라 다를 수 있습니다. 로그인 실패 시
 > `login-debug-*.png/html` 이 생성되니, 이를 참고해 `src/hiworks_auth.py` 상단의
@@ -98,6 +120,7 @@ set -a; . /etc/hiworks-sync.env; set +a
 venv/bin/python src/hiworks_auth.py --force         # 로그인/쿠키 발급 확인
 venv/bin/python src/hiworks_sync.py                 # 동기화
 mysql -e "SELECT COUNT(*) FROM asterisk.cid_lookup;"  # 연락처 수가 아니라 고유 전화번호 수
+mysql -e "SELECT COUNT(*) FROM asterisk.hiworks_contacts;"  # 공유주소록 연락처 수
 curl "http://127.0.0.1:8088/cid?number=01012345678"
 ```
 
@@ -130,8 +153,9 @@ bash /opt/hiworks/deploy/update.sh
 
 `git pull` → 의존성 반영 → 앱 DB 인증 확인 → 스키마 마이그레이션 → 유닛 반영 → 조회 서비스
 재시작 → 즉시 1회 동기화 순서로 진행합니다. 인증이나 마이그레이션 실패 시 서비스 재시작 전에
-중단합니다. `grade`가 없는 기존 테이블은 먼저 덤프를 저장하고 컬럼을 추가하며, 이미 있으면
-변경하지 않습니다. 백업 위치는 `/var/backups/hiworks-cid/`이고 파일 권한은 600입니다
+중단합니다. 원본 미러 테이블은 없는 경우 추가 생성하고 필요한 권한만 동기화 계정에 부여합니다.
+`grade`가 없는 기존 CID 테이블은 먼저 덤프를 저장하고 컬럼을 추가하며, 이미 있으면 변경하지 않습니다.
+백업 위치는 `/var/backups/hiworks-cid/`이고 파일 권한은 600입니다
 (`MIGRATION_BACKUP_DIR`로 변경 가능). 백업 실패 시 컬럼도 변경하지 않습니다.
 
 DB 인증이 실패하면 `/etc/hiworks-sync.env`의 DB명·계정·비밀번호를 기존 DB 설정과 대조하세요.
@@ -160,6 +184,8 @@ mariadb --host=127.0.0.1 --user=hiworks_sync --password asterisk
   실제 자격증명은 `/etc/hiworks-sync.env` (권한 600) 에만 두세요.
 - 조회 포트(8088)/MySQL 은 방화벽에서 **Asterisk 서버 IP만** 허용하세요.
 - 주소록은 개인정보입니다. 서버 접근통제와 백업 취급에 유의하세요.
+- 전체 미러에는 이메일·주소·메모도 포함됩니다. Asterisk 조회 계정에는 `cid_lookup` 읽기 권한만 주고,
+  미러 테이블과 MariaDB 포트를 외부에 공개하지 마세요.
 - 전용 계정은 **주소록 읽기 최소 권한** 으로 두는 것을 권장합니다.
 
 ## 한계 · 주의 (반드시 읽어주세요)

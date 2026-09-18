@@ -24,13 +24,18 @@ def contacts_page(rows=None, *, limit=500, offset=0, total=None):
     }
 
 
-def contact_detail(number=1, phones=None):
+def contact_detail(number=1, phones=None, emails=None, addresses=None, tags=None):
     return {
         "data": {
             "no": number,
             "phones": phones if phones is not None else [
                 {"type": "휴대폰", "phone": "01011112222", "is_default": True},
             ],
+            "emails": emails if emails is not None else [
+                {"email": "person@example.invalid", "is_default": True},
+            ],
+            "addresses": addresses if addresses is not None else [],
+            "tags": tags if tags is not None else [],
         },
     }
 
@@ -100,6 +105,18 @@ class ContactDetailPayloadTests(unittest.TestCase):
         invalid[-1]["data"]["phones"] = None
         for payload in invalid:
             with self.subTest(payload=payload), self.assertRaises(PayloadError):
+                parse_contact_detail(payload)
+
+    def test_rejects_invalid_email_or_other_array_shape(self):
+        for field, value in (("email", None), ("is_default", 1)):
+            payload = contact_detail()
+            payload["data"]["emails"][0][field] = value
+            with self.subTest(field=field), self.assertRaises(PayloadError):
+                parse_contact_detail(payload)
+        for field in ("emails", "addresses", "tags"):
+            payload = contact_detail()
+            payload["data"][field] = None
+            with self.subTest(field=field), self.assertRaises(PayloadError):
                 parse_contact_detail(payload)
         for field, value in (("type", None), ("phone", []), ("is_default", 1)):
             payload = contact_detail()

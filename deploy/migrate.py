@@ -11,6 +11,17 @@ import sys
 import tempfile
 
 
+TABLES = (
+    "cid_lookup",
+    "hiworks_contacts",
+    "hiworks_contact_phones",
+    "hiworks_contact_emails",
+    "hiworks_contact_addresses",
+    "hiworks_contact_tags",
+    "hiworks_organization_snapshot",
+)
+
+
 class DeploymentError(Exception):
     pass
 
@@ -63,7 +74,11 @@ def verify_credentials(settings, *, database=True, schema=False):
                                connect_timeout=5, read_timeout=10, write_timeout=10)
         try:
             with conn.cursor() as cur:
-                cur.execute("SELECT phone, name, company, grade FROM cid_lookup LIMIT 0" if schema else "SELECT 1")
+                if schema:
+                    for table in TABLES:
+                        cur.execute(f"SELECT * FROM `{table}` LIMIT 0")
+                else:
+                    cur.execute("SELECT 1")
         finally:
             conn.close()
     except pymysql.MySQLError as exc:
@@ -74,8 +89,40 @@ def verify_credentials(settings, *, database=True, schema=False):
         ) from exc
 
 
+def schema_definitions():
+    schema = (Path(__file__).resolve().parents[1] / "schema.sql").read_text()
+    definitions = {}
+    pattern = re.compile(
+        r"CREATE TABLE IF NOT EXISTS\s+([A-Za-z0-9_]+)\s*(\(.*?\)\s*ENGINE=.*?;)",
+        re.DOTALL,
+    )
+    for match in pattern.finditer(schema):
+        definitions[match.group(1)] = f"CREATE TABLE IF NOT EXISTS `{match.group(1)}` {match.group(2)}"
+    missing = set(TABLES) - set(definitions)
+    if missing:
+        raise DeploymentError(f"schema.sql에 테이블 정의가 없습니다: {', '.join(sorted(missing))}")
+    return definitions
+
+
+def create_tables(admin, settings, tables=TABLES):
+    definitions = schema_definitions()
+    with admin.cursor() as cur:
+        cur.execute(f"USE `{settings.database}`")
+        for table in tables:
+            cur.execute(definitions[table])
+
+
+def grant_tables(admin, settings):
+    with admin.cursor() as cur:
+        for table in TABLES:
+            cur.execute(
+                f"GRANT SELECT,INSERT,UPDATE,DELETE ON `{settings.database}`.`{table}` TO %s@%s",
+                (settings.user, "localhost"),
+            )
+
+
 def initialize(admin, settings):
-    """Create only missing accounts; never reset an existing account password."""
+    """Create only missing accounts/schema; never reset an existing account password."""
     with admin.cursor() as cur:
         cur.execute("SELECT 1 FROM mysql.user WHERE User=%s AND Host=%s", (settings.user, "localhost"))
         exists = cur.fetchone() is not None
@@ -84,16 +131,10 @@ def initialize(admin, settings):
         verify_credentials(settings, database=False)
     with admin.cursor() as cur:
         cur.execute(f"CREATE DATABASE IF NOT EXISTS `{settings.database}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci")
-        # Keep initial table definitions in schema.sql; execute only its CREATE TABLE.
-        schema = (Path(__file__).resolve().parents[1] / "schema.sql").read_text()
-        match = re.search(r"CREATE TABLE IF NOT EXISTS cid_lookup\s*\(.*?;", schema, re.DOTALL)
-        if not match:
-            raise DeploymentError("schema.sql에서 cid_lookup 테이블 정의를 찾지 못했습니다.")
-        cur.execute(match.group().replace("cid_lookup", f"`{settings.database}`.`cid_lookup`", 1))
         if not exists:
             cur.execute("CREATE USER %s@%s IDENTIFIED BY %s", (settings.user, "localhost", settings.password))
-        cur.execute(f"GRANT SELECT,INSERT,UPDATE,DELETE ON `{settings.database}`.`cid_lookup` TO %s@%s",
-                    (settings.user, "localhost"))
+    create_tables(admin, settings)
+    grant_tables(admin, settings)
 
 
 def backup_table(settings):
@@ -123,16 +164,28 @@ def migrate(admin, settings):
         cur.execute("SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=%s AND TABLE_NAME=%s",
                     (settings.database, "cid_lookup"))
         columns = {row[0] for row in cur.fetchall()}
+        cur.execute("SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA=%s",
+                    (settings.database,))
+        existing_tables = {row[0] for row in cur.fetchall()}
     if not {"phone", "name", "company", "updated_at"}.issubset(columns):
         raise DeploymentError("cid_lookup 기본 스키마가 없거나 예상과 다릅니다. 신규 설치는 install.sh를 사용하세요.")
-    if "grade" in columns:
+    changed = False
+    if "grade" not in columns:
+        backup_table(settings)
+        with admin.cursor() as cur:
+            cur.execute(f"ALTER TABLE `{settings.database}`.`cid_lookup` ADD COLUMN `grade` VARCHAR(100) DEFAULT NULL AFTER `company`")
+        print("DB 마이그레이션: cid_lookup.grade 컬럼 추가.")
+        changed = True
+
+    missing_tables = [table for table in TABLES if table not in existing_tables]
+    if missing_tables:
+        create_tables(admin, settings, missing_tables)
+        print(f"DB 마이그레이션: 원본 미러 테이블 {len(missing_tables)}개 생성.")
+        changed = True
+    grant_tables(admin, settings)
+    if not changed:
         print("DB 스키마 최신 상태: 변경 없음.")
-        return False
-    backup_table(settings)
-    with admin.cursor() as cur:
-        cur.execute(f"ALTER TABLE `{settings.database}`.`cid_lookup` ADD COLUMN `grade` VARCHAR(100) DEFAULT NULL AFTER `company`")
-    print("DB 마이그레이션 완료: grade 컬럼 추가.")
-    return True
+    return changed
 
 
 def deploy_database(settings, *, create=False):

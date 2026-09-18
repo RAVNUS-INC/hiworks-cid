@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-Hiworks 주소록 -> MySQL(asterisk.cid_lookup) 동기화
+Hiworks 주소록 -> MySQL 원본 미러 + Asterisk CID 조회 테이블 동기화
 
 동작:
   1) contact-api.office.hiworks.com/v2/contacts 를 호출해 전체 연락처를 가져온다
-  2) 전화번호를 숫자만 남겨 정규화한다 (한 연락처가 여러 번호를 가지면 각각 등록)
-  3) MySQL cid_lookup 테이블을 현재 스냅샷으로 교체(upsert + 사라진 번호 삭제)한다
+  2) 연락처 상세의 모든 필드와 배열을 원본 그대로 보존한다
+  3) 전화번호를 숫자만 남겨 정규화하고 CID 조회값을 만든다
+  4) 원본 미러와 cid_lookup을 한 트랜잭션으로 현재 스냅샷에 맞춘다
 
 인증:
   이 API는 브라우저 쿠키 세션을 사용한다. hiworks_auth.get_cookie() 가 전용계정으로
@@ -124,7 +125,7 @@ def _load_detail_cache():
     """Load the private detail cache. Malformed/old formats are treated as empty."""
     try:
         payload = json.loads(DETAIL_CACHE_FILE.read_text())
-        if payload.get("version") != 1 or not isinstance(payload.get("contacts"), dict):
+        if payload.get("version") != 2 or not isinstance(payload.get("contacts"), dict):
             return {}
         return payload["contacts"]
     except Exception:
@@ -132,7 +133,7 @@ def _load_detail_cache():
 
 
 def _save_detail_cache(contacts):
-    """Atomically save contact phone details with private file permissions."""
+    """Atomically save full contact details with private file permissions."""
     temporary = None
     try:
         DETAIL_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -142,7 +143,7 @@ def _save_detail_cache(contacts):
         ) as stream:
             temporary = Path(stream.name)
             os.fchmod(stream.fileno(), 0o600)
-            json.dump({"version": 1, "contacts": contacts}, stream, ensure_ascii=False)
+            json.dump({"version": 2, "contacts": contacts}, stream, ensure_ascii=False)
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, DETAIL_CACHE_FILE)
@@ -158,15 +159,14 @@ def _cached_detail(cache, row, now):
     fetched_at = entry.get("fetched_at")
     if type(fetched_at) not in (int, float) or not 0 <= now - fetched_at <= DETAIL_CACHE_MAX_AGE:
         return None
-    phones = entry.get("phones")
-    if not isinstance(phones, list):
+    detail = entry.get("detail")
+    if not isinstance(detail, dict):
         return None
-    for phone in phones:
-        if not isinstance(phone, dict) or not isinstance(phone.get("type"), str) \
-                or not isinstance(phone.get("phone"), str) \
-                or type(phone.get("is_default")) is not bool:
-            return None
-    return phones
+    try:
+        parse_contact_detail({"data": detail}, expected_no=row["no"])
+    except PayloadError:
+        return None
+    return detail
 
 
 def _fetch_contact_detail(row, cookie):
@@ -192,7 +192,7 @@ def _fetch_contact_detail(row, cookie):
     detailed = {normalize(phone["phone"]) for phone in phones}
     if listed and listed not in detailed:
         raise PayloadError("연락처 상세에 목록의 대표 전화번호가 없습니다.")
-    return phones
+    return detail
 
 
 def _fetch_detail_batch(rows, cookie):
@@ -209,23 +209,23 @@ def _fetch_detail_batch(rows, cookie):
     return results, errors
 
 
-def fetch_contact_phones(rows):
-    """Return {contact_no: phones[]} from detail API, reusing unchanged private cache entries."""
+def fetch_contact_details(rows):
+    """Return {contact_no: detail} while reusing unchanged private cache entries."""
     if DETAIL_CACHE_MAX_AGE <= 0 or DETAIL_WORKERS <= 0:
         raise ValueError("CONTACT_DETAIL_CACHE_MAX_AGE와 CONTACT_DETAIL_WORKERS는 양수여야 합니다.")
     eligible = [
         row for row in rows
-        if row.get("type") == "shared" and not row.get("owner") and (row.get("name") or "").strip()
+        if row.get("type") == "shared" and not row.get("owner")
     ]
     now = time.time()
     old_cache = _load_detail_cache()
-    phones_by_contact, cache_entries, pending = {}, {}, []
+    details_by_contact, cache_entries, pending = {}, {}, []
     for row in eligible:
         cached = _cached_detail(old_cache, row, now)
         if cached is None:
             pending.append(row)
             continue
-        phones_by_contact[row["no"]] = cached
+        details_by_contact[row["no"]] = cached
         cache_entries[str(row["no"])] = old_cache[str(row["no"])]
 
     if pending:
@@ -243,21 +243,109 @@ def fetch_contact_phones(rows):
                     raise RuntimeError("재로그인 후에도 연락처 상세 인증에 실패했습니다.") from error
                 raise error
         for row in pending:
-            phones = fetched[row["no"]]
-            phones_by_contact[row["no"]] = phones
+            detail = fetched[row["no"]]
+            details_by_contact[row["no"]] = detail
             cache_entries[str(row["no"])] = {
                 "updated_at": row.get("updated_at"),
                 "fetched_at": now,
-                "phones": phones,
+                "detail": detail,
             }
 
     _save_detail_cache(cache_entries)
-    return phones_by_contact
+    return details_by_contact
 
 
-def build_entries(rows, phones_by_contact=None):
-    """공유주소록 -> {phone: (name, company, grade)}. 상세의 모든 번호를 각각 등록."""
-    seen = {}
+def fetch_contact_phones(rows):
+    """Compatibility helper returning only phones from the full detail snapshot."""
+    return {contact_no: detail["phones"] for contact_no, detail in fetch_contact_details(rows).items()}
+
+
+def _phone_parts(raw_phone):
+    """Yield valid normalized numbers from one source value."""
+    for part in re.split(r"[,/;\n]", raw_phone or ""):
+        phone = normalize(part)
+        if phone:
+            yield phone
+
+
+def _phone_kind(value):
+    compact = re.sub(r"\s", "", (value or "")).casefold()
+    if compact in {"휴대폰", "핸드폰", "mobile", "cell", "cellphone"}:
+        return "mobile"
+    if compact in {"fax", "팩스"}:
+        return "fax"
+    if compact in {"회사", "회사전화", "work", "office"}:
+        return "company"
+    if compact in {"집전화", "자택", "home"}:
+        return "home"
+    return "other"
+
+
+def _company_key(value):
+    """Compare common company spelling variants without changing the saved display value."""
+    compact = re.sub(r"[\s·._-]", "", (value or "")).casefold()
+    return re.sub(r"^(?:\(주\)|㈜|주식회사)", "", compact)
+
+
+def _best_candidate(candidates):
+    return sorted(
+        candidates,
+        key=lambda item: (
+            not item["is_default"],
+            not bool(item["company"]),
+            not bool(item["grade"]),
+            item["contact_no"],
+        ),
+    )[0]
+
+
+def _resolve_contact_phone(phone, candidates):
+    """Resolve one CID row without assigning a shared number to an arbitrary person."""
+    by_contact = {}
+    for candidate in candidates:
+        by_contact.setdefault(candidate["contact_no"], candidate)
+    unique = list(by_contact.values())
+    if len(unique) == 1:
+        selected = unique[0]
+        return (selected["name"], selected["company"], selected["grade"]), None
+
+    kinds = {candidate["kind"] for candidate in unique}
+    names = {candidate["name"] for candidate in unique}
+    if kinds == {"mobile"}:
+        if len(names) == 1:
+            selected = _best_candidate(unique)
+            return (selected["name"], selected["company"], selected["grade"]), {
+                "phone": phone, "kind": "duplicate_mobile_same_name", "count": len(unique),
+            }
+        return ("중복 연락처", None, None), {
+            "phone": phone, "kind": "duplicate_mobile_different_names", "count": len(unique),
+        }
+
+    companies = {}
+    for candidate in unique:
+        key = _company_key(candidate["company"])
+        if key:
+            companies.setdefault(key, []).append(candidate["company"])
+    if len(companies) == 1:
+        variants = next(iter(companies.values()))
+        # Prefer the most descriptive original spelling, deterministically.
+        company = sorted(set(variants), key=lambda value: (-len(value), value))[0]
+        return (company, None, None), {
+            "phone": phone, "kind": "shared_company_number", "count": len(unique),
+        }
+    if len(names) == 1:
+        selected = _best_candidate(unique)
+        return (selected["name"], selected["company"], selected["grade"]), {
+            "phone": phone, "kind": "duplicate_same_name", "count": len(unique),
+        }
+    return ("공용번호", None, None), {
+        "phone": phone, "kind": "shared_number_multiple_companies", "count": len(unique),
+    }
+
+
+def build_entries(rows, details_by_contact=None, *, include_conflicts=False):
+    """공유주소록 -> CID rows. Shared numbers resolve to a company-safe display."""
+    candidates = {}
     for c in rows:
         # 공유주소록만 동기화 (개인 소유 항목은 제외).
         # 현재 API는 type='shared'만 내려주지만, 만일을 대비해 코드로도 막는다.
@@ -268,20 +356,83 @@ def build_entries(rows, phones_by_contact=None):
             continue
         company = (c.get("company") or "").strip() or None
         grade = (c.get("grade") or "").strip() or None
-        if phones_by_contact is None:
-            raw_phones = [c.get("phone") or ""]
+        if details_by_contact is None:
+            phones = [{"phone": c.get("phone") or "", "type": "", "is_default": True}]
         else:
-            if c["no"] not in phones_by_contact:
+            if c["no"] not in details_by_contact:
                 raise PayloadError("공유 연락처의 상세 전화번호가 누락되었습니다.")
-            raw_phones = [phone["phone"] for phone in phones_by_contact[c["no"]]]
-        for raw_phone in raw_phones:
-            # 각 상세 번호 안에 구분자로 여러 번호가 들어간 기존 데이터도 호환한다.
-            for part in re.split(r"[,/;\n]", raw_phone):
-                p = normalize(part)
-                if p:
-                    # 먼저 들어온 값 우선(중복 번호는 첫 이름 유지)
-                    seen.setdefault(p, (name, company, grade))
-    return seen
+            detail = details_by_contact[c["no"]]
+            phones = detail["phones"] if isinstance(detail, dict) else detail
+        for source in phones:
+            for phone in _phone_parts(source["phone"]):
+                candidates.setdefault(phone, []).append({
+                    "contact_no": c["no"], "name": name, "company": company,
+                    "grade": grade, "kind": _phone_kind(source.get("type")),
+                    "is_default": bool(source.get("is_default")),
+                })
+
+    entries, conflicts = {}, []
+    for phone, phone_candidates in candidates.items():
+        entries[phone], conflict = _resolve_contact_phone(phone, phone_candidates)
+        if conflict:
+            conflicts.append(conflict)
+    return (entries, conflicts) if include_conflicts else entries
+
+
+def _json(value):
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _text(value):
+    if value is None or isinstance(value, str):
+        return value
+    return _json(value)
+
+
+def build_contact_snapshot(rows, details_by_contact):
+    """Build relational rows while preserving the exact list/detail payloads."""
+    contacts, phones, emails, addresses, tags = [], [], [], [], []
+    for row in rows:
+        if row.get("type") != "shared" or row.get("owner"):
+            continue
+        if row["no"] not in details_by_contact:
+            raise PayloadError("공유 연락처의 상세 데이터가 누락되었습니다.")
+        detail = details_by_contact[row["no"]]
+        contact_type = row["type"]
+        contact_no = row["no"]
+
+        def field(name):
+            value = detail.get(name, row.get(name))
+            return value.strip() or None if isinstance(value, str) else value
+
+        contacts.append((
+            contact_type, contact_no, bool(row.get("owner")), field("name") or "",
+            field("company"), field("department"), field("grade"), field("homepage"),
+            field("birth"), field("memo"), field("image"), field("calendar_type"),
+            detail.get("allow_editing"), detail.get("is_star", row.get("star")),
+            detail.get("is_owner", row.get("owner")), field("updater"),
+            field("created_at"), field("updated_at"), _json(row), _json(detail),
+        ))
+        for ordinal, item in enumerate(detail["phones"]):
+            normalized = list(_phone_parts(item["phone"]))
+            phones.append((
+                contact_type, contact_no, ordinal, item["type"], item["phone"],
+                normalized[0] if len(normalized) == 1 else None,
+                item["is_default"], _json(item),
+            ))
+        for ordinal, item in enumerate(detail["emails"]):
+            emails.append((contact_type, contact_no, ordinal, item["email"],
+                           item["is_default"], _json(item)))
+        for ordinal, item in enumerate(detail["addresses"]):
+            value = item.get("address", item.get("value")) if isinstance(item, dict) else item
+            addresses.append((contact_type, contact_no, ordinal, _text(value), _json(item)))
+        for ordinal, item in enumerate(detail["tags"]):
+            value = item.get("name", item.get("value")) if isinstance(item, dict) else item
+            tags.append((contact_type, contact_no, ordinal, _text(value), _json(item)))
+    return {
+        "contacts": contacts, "phones": phones, "emails": emails,
+        "addresses": addresses, "tags": tags,
+    }
 
 
 def fetch_org():
@@ -329,7 +480,8 @@ def build_org_entries(root):
     return seen
 
 
-def sync_mysql(entries):
+def sync_mysql(entries, snapshot=None, organization=None):
+    """Atomically replace the source mirror and reconcile the derived CID table."""
     conn = pymysql.connect(
         host=os.getenv("MYSQL_HOST", "127.0.0.1"),
         port=int(os.getenv("MYSQL_PORT", "3306")),
@@ -341,12 +493,54 @@ def sync_mysql(entries):
     )
     try:
         with conn.cursor() as cur:
+            if snapshot is not None:
+                # Child rows are removed by FK cascade. Readers see either the old or new
+                # complete mirror because every change stays in this transaction.
+                cur.execute("DELETE FROM hiworks_contacts")
+                if snapshot["contacts"]:
+                    cur.executemany(
+                        "INSERT INTO hiworks_contacts ("
+                        "contact_type, contact_no, owner, name, company, department, grade, "
+                        "homepage, birth, memo, image, calendar_type, allow_editing, is_star, "
+                        "is_owner, updater, source_created_at, source_updated_at, list_json, detail_json"
+                        ") VALUES (" + ",".join(["%s"] * 20) + ")",
+                        snapshot["contacts"],
+                    )
+                child_specs = (
+                    ("hiworks_contact_phones",
+                     "contact_type,contact_no,ordinal_no,phone_type,phone_raw,phone_normalized,is_default,raw_json",
+                     snapshot["phones"], 8),
+                    ("hiworks_contact_emails",
+                     "contact_type,contact_no,ordinal_no,email,is_default,raw_json",
+                     snapshot["emails"], 6),
+                    ("hiworks_contact_addresses",
+                     "contact_type,contact_no,ordinal_no,value_text,raw_json",
+                     snapshot["addresses"], 5),
+                    ("hiworks_contact_tags",
+                     "contact_type,contact_no,ordinal_no,value_text,raw_json",
+                     snapshot["tags"], 5),
+                )
+                for table, columns, values, width in child_specs:
+                    if values:
+                        cur.executemany(
+                            f"INSERT INTO {table} ({columns}) VALUES (" + ",".join(["%s"] * width) + ")",
+                            values,
+                        )
+                if organization is None:
+                    cur.execute("DELETE FROM hiworks_organization_snapshot")
+                else:
+                    cur.execute(
+                        "INSERT INTO hiworks_organization_snapshot (snapshot_id, raw_json) VALUES (1,%s) "
+                        "ON DUPLICATE KEY UPDATE raw_json=VALUES(raw_json)",
+                        (_json(organization),),
+                    )
             # upsert
-            cur.executemany(
-                "INSERT INTO cid_lookup (phone, name, company, grade) VALUES (%s,%s,%s,%s) "
-                "ON DUPLICATE KEY UPDATE name=VALUES(name), company=VALUES(company), grade=VALUES(grade)",
-                entries,
-            )
+            if entries:
+                cur.executemany(
+                    "INSERT INTO cid_lookup (phone, name, company, grade) VALUES (%s,%s,%s,%s) "
+                    "ON DUPLICATE KEY UPDATE name=VALUES(name), company=VALUES(company), grade=VALUES(grade)",
+                    entries,
+                )
             # 이번 스냅샷에 없는 번호 삭제
             phones = [e[0] for e in entries]
             if phones:
@@ -418,8 +612,9 @@ def _send_alert(payload):
 def main():
     try:
         rows = fetch_all()
-        phones_by_contact = fetch_contact_phones(rows)
-        contacts = build_entries(rows, phones_by_contact)
+        details_by_contact = fetch_contact_details(rows)
+        contacts, conflicts = build_entries(rows, details_by_contact, include_conflicts=True)
+        snapshot = build_contact_snapshot(rows, details_by_contact)
         # 조직도(직원). 토큰 미설정이면 None → 공유주소록만.
         # 실패 시 전체 실패로 처리(부분 성공으로 직원이 스냅샷에서 사라지는 것 방지).
         org = fetch_org()
@@ -427,7 +622,7 @@ def main():
         # 같은 번호가 양쪽에 있으면 직원(조직도) 우선
         merged = {**contacts, **employees}
         entries = [(p, n, co, g) for p, (n, co, g) in merged.items()]
-        sync_mysql(entries)
+        sync_mysql(entries, snapshot, org)
     except Exception as e:
         state = _load_state()
         n = state["fails"] + 1
@@ -446,9 +641,13 @@ def main():
     if prev >= ALERT_AFTER_FAILURES:
         _send_alert({"status": "recovered", "after_failures": prev})
     emp_note = f" (직원 {len(employees)}번호 포함)" if employees else ""
-    detail_numbers = sum(len(phones) for phones in phones_by_contact.values())
+    detail_numbers = sum(len(detail["phones"]) for detail in details_by_contact.values())
+    conflict_counts = {}
+    for conflict in conflicts:
+        conflict_counts[conflict["kind"]] = conflict_counts.get(conflict["kind"], 0) + 1
+    conflict_note = f" / 중복정책 {conflict_counts}" if conflict_counts else ""
     print(f"동기화 완료: 연락처 {len(rows)}건/상세번호 {detail_numbers}건 -> "
-          f"고유번호 {len(entries)}건 적재{emp_note}")
+          f"고유번호 {len(entries)}건 적재{emp_note}{conflict_note}")
 
 
 if __name__ == "__main__":

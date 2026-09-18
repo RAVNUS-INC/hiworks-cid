@@ -121,6 +121,7 @@ class DatabaseMigrationTests(unittest.TestCase):
         self.admin = Mock()
         self.admin.cursor.return_value = self.context
         self.base_columns = [(name,) for name in ("phone", "name", "company", "updated_at")]
+        self.all_tables = [(name,) for name in migration.TABLES]
 
     def test_database_identifier_rejected_before_connection(self):
         with patch.dict(os.environ, {"MYSQL_USER": "hiworks_sync", "MYSQL_PASSWORD": "test-only",
@@ -150,14 +151,16 @@ class DatabaseMigrationTests(unittest.TestCase):
         self.assertNotIn(self.settings.password, create.args[0])
 
     def test_current_schema_is_no_op_without_backup(self):
-        self.cursor.fetchall.return_value = self.base_columns + [("grade",)]
+        self.cursor.fetchall.side_effect = [self.base_columns + [("grade",)], self.all_tables]
         with patch.object(migration, "backup_table") as backup:
             self.assertFalse(migration.migrate(self.admin, self.settings))
         backup.assert_not_called()
-        self.assertEqual(self.cursor.execute.call_count, 1)
 
     def test_missing_grade_is_backed_up_then_added_once(self):
-        self.cursor.fetchall.side_effect = [self.base_columns, self.base_columns + [("grade",)]]
+        self.cursor.fetchall.side_effect = [
+            self.base_columns, self.all_tables,
+            self.base_columns + [("grade",)], self.all_tables,
+        ]
         events = []
         self.cursor.execute.side_effect = lambda sql, *args: events.append(sql)
         with patch.object(migration, "backup_table", side_effect=lambda settings: events.append("BACKUP")):
@@ -168,8 +171,23 @@ class DatabaseMigrationTests(unittest.TestCase):
         self.assertIn("`review_test`.`cid_lookup`", alters[0])
         self.assertLess(events.index("BACKUP"), events.index(alters[0]))
 
+    def test_missing_mirror_tables_are_created_without_altering_cid_table(self):
+        self.cursor.fetchall.side_effect = [
+            self.base_columns + [("grade",)], [("cid_lookup",)],
+        ]
+        with patch.object(migration, "create_tables") as create, \
+                patch.object(migration, "grant_tables"):
+            self.assertTrue(migration.migrate(self.admin, self.settings))
+        expected = [table for table in migration.TABLES if table != "cid_lookup"]
+        create.assert_called_once_with(self.admin, self.settings, expected)
+        self.assertFalse(any(call.args[0].startswith("ALTER TABLE")
+                             for call in self.cursor.execute.call_args_list))
+
+    def test_schema_file_defines_every_managed_table(self):
+        self.assertEqual(set(migration.schema_definitions()), set(migration.TABLES))
+
     def test_failed_backup_prevents_alter(self):
-        self.cursor.fetchall.return_value = self.base_columns
+        self.cursor.fetchall.side_effect = [self.base_columns, self.all_tables]
         with patch.object(migration, "backup_table", side_effect=migration.DeploymentError("backup failed")):
             with self.assertRaises(migration.DeploymentError):
                 migration.migrate(self.admin, self.settings)
